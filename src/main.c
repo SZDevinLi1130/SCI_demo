@@ -11,6 +11,7 @@
 #include <zephyr/logging/log.h>
 
 #include <zephyr/drivers/uart.h>
+#include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -33,6 +34,29 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+
+enum role_selection {
+	ROLE_SELECTION_NONE,
+	ROLE_SELECTION_PERIPHERAL,
+	ROLE_SELECTION_CENTRAL,
+};
+
+#define ROLE_INPUT_THREAD_STACK_SIZE 1024
+#define ROLE_INPUT_THREAD_PRIORITY 7
+
+static struct gpio_callback button0_cb_data;
+static struct gpio_callback button1_cb_data;
+static volatile enum role_selection selected_role = ROLE_SELECTION_NONE;
+K_THREAD_STACK_DEFINE(role_input_thread_stack, ROLE_INPUT_THREAD_STACK_SIZE);
+static struct k_thread role_input_thread_data;
+
+static void set_connection_leds(bool connected)
+{
+	gpio_pin_set_dt(&led0, connected ? 1 : 0);
+	gpio_pin_set_dt(&led1, 0);
+}
 
 // static uint32_t test_intervals[] = {
 // 	0,    /* Will be replaced with minimum supported interval */
@@ -61,6 +85,7 @@ static K_SEM_DEFINE(phy_updated, 0, 1);
 static K_SEM_DEFINE(min_interval_read_sem, 0, 1);
 static K_SEM_DEFINE(frame_space_updated_sem, 0, 1);
 static K_SEM_DEFINE(discovery_complete_sem, 0, 1);
+static K_SEM_DEFINE(role_selected_sem, 0, 1);
 
 static bool test_ready;
 static bool initiate_conn_rate_update = true;
@@ -186,6 +211,110 @@ static void scan_init(void)
 	if (err) {
 		LOG_WRN("Filters cannot be turned on (err %d)", err);
 	}
+}
+
+static bool try_select_role(enum role_selection role)
+{
+	if (selected_role != ROLE_SELECTION_NONE) {
+		return false;
+	}
+
+	selected_role = role;
+	k_sem_give(&role_selected_sem);
+
+	return true;
+}
+
+static void role_button_pressed(const struct device *port, struct gpio_callback *cb,
+				uint32_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+
+	if (pins & BIT(button0.pin)) {
+		try_select_role(ROLE_SELECTION_PERIPHERAL);
+	} else if (pins & BIT(button1.pin)) {
+		try_select_role(ROLE_SELECTION_CENTRAL);
+	}
+}
+
+static void role_input_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (true) {
+		char input_char = console_getchar();
+
+		if (selected_role != ROLE_SELECTION_NONE) {
+			return;
+		}
+
+		if ((input_char == 'p') || (input_char == 'P')) {
+			if (try_select_role(ROLE_SELECTION_PERIPHERAL)) {
+				LOG_INF("Peripheral selected from console");
+				return;
+			}
+		} else if ((input_char == 'c') || (input_char == 'C')) {
+			if (try_select_role(ROLE_SELECTION_CENTRAL)) {
+				LOG_INF("Central selected from console");
+				return;
+			}
+		} else {
+			LOG_INF("Invalid role, use p/c or BUTTON0/BUTTON1");
+		}
+	}
+}
+
+static int buttons_init(void)
+{
+	int err;
+
+	if (!gpio_is_ready_dt(&button0) || !gpio_is_ready_dt(&button1)) {
+		LOG_ERR("Button device not ready");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&button0, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Failed to configure BUTTON0 (err %d)", err);
+		return err;
+	}
+
+	err = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Failed to configure BUTTON1 (err %d)", err);
+		return err;
+	}
+
+	gpio_init_callback(&button0_cb_data, role_button_pressed, BIT(button0.pin));
+	err = gpio_add_callback(button0.port, &button0_cb_data);
+	if (err) {
+		LOG_ERR("Failed to add BUTTON0 callback (err %d)", err);
+		return err;
+	}
+
+	gpio_init_callback(&button1_cb_data, role_button_pressed, BIT(button1.pin));
+	err = gpio_add_callback(button1.port, &button1_cb_data);
+	if (err) {
+		LOG_ERR("Failed to add BUTTON1 callback (err %d)", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("Failed to enable BUTTON0 interrupt (err %d)", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("Failed to enable BUTTON1 interrupt (err %d)", err);
+		return err;
+	}
+
+	return 0;
 }
 
 static uint8_t read_min_interval_cb(struct bt_conn *conn, uint8_t err,
@@ -337,6 +466,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		LOG_WRN("Connection failed, err 0x%02x %s", err, bt_hci_err_to_str(err));
+		set_connection_leds(false);
 		if (is_central) {
 			scan_start();
 		} else {
@@ -384,7 +514,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		LOG_WRN("Discover failed (err %d)", err);
 	}
 #endif /* CONFIG_BT_SMP */
-	gpio_pin_set_dt(&led0, 1);
+	set_connection_leds(true);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -408,8 +538,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		adv_start();
 	}
 
-	gpio_pin_set_dt(&led0, 0);
-	gpio_pin_set_dt(&led1, 0);
+	set_connection_leds(false);
 }
 
 #if defined(CONFIG_BT_SMP)
@@ -573,14 +702,13 @@ static void latency_response_handler(const void *buf, uint16_t len)
 {
 	uint32_t latency_time;
 	gpio_pin_set_dt(&led1, 0);
+
 	if (len == sizeof(latency_time)) {
 		/* compute how much time was spent */
 		latency_time = *((uint32_t *)buf);
 		uint32_t cycles_spent = k_cycle_get_32() - latency_time;
 
 		latency_response = (uint32_t)k_cyc_to_ns_floor64(cycles_spent) / 2000;
-
-
 	}
 }
 
@@ -648,11 +776,14 @@ static void test_run(void)
 	while (default_conn) {
 		uint32_t time = k_cycle_get_32();
 
+		gpio_pin_set_dt(&led1, 1);
 		err = bt_latency_request(&latency_client, &time, sizeof(time));
 		if (err && err != -EALREADY) {
 			LOG_WRN("Latency failed (err %d)", err);
+			gpio_pin_set_dt(&led1, 0);
+			k_sleep(K_MSEC(200));
+			continue;
 		}
-		gpio_pin_set_dt(&led1, 1);
 
 		k_sleep(K_MSEC(200)); /* wait for latency response */
 
@@ -660,6 +791,7 @@ static void test_run(void)
 			LOG_INF("Transmission Latency: %u us", latency_response);
 		} else {
 			LOG_WRN("Did not receive a latency response");
+			gpio_pin_set_dt(&led1, 0);
 		}
 
 		latency_response = 0;
@@ -689,7 +821,13 @@ int main(void)
 		return 0;
 	}
 	gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
-	gpio_pin_configure_dt(&led1, GPIO_OUTPUT_HIGH);
+	gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
+	set_connection_leds(false);
+
+	err = buttons_init();
+	if (err) {
+		return 0;
+	}
 	
 	LOG_INF("Starting Bluetooth Shorter Connection Intervals sample");
 
@@ -753,27 +891,24 @@ int main(void)
 	}
 #endif
 
-	while (true) {
-		LOG_INF("Choose device role - type c (central) or p (peripheral): ");
+	k_thread_create(&role_input_thread_data, role_input_thread_stack,
+			K_THREAD_STACK_SIZEOF(role_input_thread_stack), role_input_thread,
+			NULL, NULL, NULL, ROLE_INPUT_THREAD_PRIORITY, 0, K_NO_WAIT);
 
-		char input_char = console_getchar();
+	LOG_INF("Press BUTTON0 for peripheral or BUTTON1 for central, or type p/c");
+	k_sem_take(&role_selected_sem, K_FOREVER);
+	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_DISABLE);
+	gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_DISABLE);
 
-		LOG_INF("");
-
-		if (input_char == 'c') {
-			is_central = true;
-			LOG_INF("Central. Starting scanning");
-			scan_init();
-			scan_start();
-			break;
-		} else if (input_char == 'p') {
-			is_central = false;
-			LOG_INF("Peripheral. Starting advertising");
-			adv_start();
-			break;
-		}
-
-		LOG_INF("Invalid role");
+	if (selected_role == ROLE_SELECTION_CENTRAL) {
+		is_central = true;
+		LOG_INF("Central. Starting scanning");
+		scan_init();
+		scan_start();
+	} else {
+		is_central = false;
+		LOG_INF("Peripheral. Starting advertising");
+		adv_start();
 	}
 
 	for (;;) {
