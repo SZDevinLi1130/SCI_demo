@@ -27,9 +27,9 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define DEVICE_NAME	CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
-#define INTERVAL_INITIAL	  0x8	/* 8 units, 10 ms */
-#define INTERVAL_INITIAL_US	  750 /* 10 ms */
-#define INTERVAL_UPDATE_PERIOD_MS 60000	/* Update interval every 3 seconds */
+#define INTERVAL_INITIAL	  0x8	 /* 8 units, 10 ms */
+#define INTERVAL_INITIAL_US	  10000 /* 10 ms */
+#define INTERVAL_TARGET_US	  750
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -42,9 +42,7 @@ static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 // 	4000  /* 4 ms */
 // };
 
-static uint32_t test_intervals[] = {
-	0    /* Will be replaced with minimum supported interval */
-};
+static uint32_t requested_interval_us = INTERVAL_TARGET_US;
 
 /** @brief UUID of the SCI Min Interval Service. **/
 #define BT_UUID_VS_SCI_MIN_INTERVAL_SERVICE_VAL                                                    \
@@ -66,6 +64,7 @@ static K_SEM_DEFINE(discovery_complete_sem, 0, 1);
 
 static bool test_ready;
 static bool initiate_conn_rate_update = true;
+static bool conn_rate_update_pending = true;
 static bool is_central;
 
 static uint32_t latency_response;
@@ -151,7 +150,7 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info, bool c
 
 	bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
 
-	LOG_INF("Filter does not match. Address: %s connectable: %d", addr, connectable);
+	// LOG_INF("Filter does not match. Address: %s connectable: %d", addr, connectable);
 }
 
 static void scan_connecting_error(struct bt_scan_device_info *device_info)
@@ -338,8 +337,19 @@ static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		LOG_WRN("Connection failed, err 0x%02x %s", err, bt_hci_err_to_str(err));
+		if (is_central) {
+			scan_start();
+		} else {
+			adv_start();
+		}
 		return;
 	}
+
+	conn_rate_update_pending = true;
+	remote_min_interval_us = 0;
+	common_min_interval_us = 0;
+	remote_min_interval_handle = 0;
+	requested_interval_us = MAX((uint32_t)local_min_interval_us, (uint32_t)INTERVAL_TARGET_US);
 
 	default_conn = bt_conn_ref(conn);
 	err = bt_conn_get_info(default_conn, &conn_info);
@@ -382,6 +392,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	LOG_INF("Disconnected, reason 0x%02x %s", reason, bt_hci_err_to_str(reason));
 
 	test_ready = false;
+	conn_rate_update_pending = true;
 
 	if (default_conn) {
 		bt_conn_unref(default_conn);
@@ -611,7 +622,8 @@ static void test_run(void)
 
 			/* Select the shortest interval supported by both devices. */
 			common_min_interval_us = MAX(local_min_interval_us, remote_min_interval_us);
-			test_intervals[0] = common_min_interval_us;
+			requested_interval_us =
+				MAX((uint32_t)common_min_interval_us, (uint32_t)INTERVAL_TARGET_US);
 
 			LOG_INF("Minimum connection intervals: Local: %u us, Peer: %u us, "
 				"Common: %u us",
@@ -620,8 +632,17 @@ static void test_run(void)
 		}
 	}
 
-	uint8_t interval_index = 0;
-	int64_t next_update_time = 0;
+	if (initiate_conn_rate_update && conn_rate_update_pending) {
+		LOG_INF("Requesting new connection interval: %u us", requested_interval_us);
+
+		err = conn_rate_request(requested_interval_us, requested_interval_us);
+		if (err) {
+			LOG_WRN("Connection rate update failed (err %d)", err);
+			return;
+		}
+
+		conn_rate_update_pending = false;
+	}
 
 	/* Start sending timestamps to the peer device */
 	while (default_conn) {
@@ -642,37 +663,6 @@ static void test_run(void)
 		}
 
 		latency_response = 0;
-
-		if (initiate_conn_rate_update) {
-			int64_t current_time = k_uptime_get();
-
-			if (current_time >= next_update_time) {
-				next_update_time = current_time + INTERVAL_UPDATE_PERIOD_MS;
-
-				uint32_t new_interval_us = test_intervals[interval_index];
-
-				LOG_INF("Requesting new connection interval: %u us",
-					new_interval_us);
-
-				/* As a central, the lowest supported interval of the peripheral
-				 * needs to be obtained before initiating a connection rate request,
-				 * as interval_min cannot be lower than the peripheral's minimum
-				 * supported interval. As a peripheral, calculating the common
-				 * minimum interval is optional, as requesting a range will allow
-				 * the central to select the lowest interval it can support.
-				 */
-				err = conn_rate_request(new_interval_us, INTERVAL_INITIAL_US);
-
-				if (err) {
-					LOG_WRN("Connection rate update failed (err %d)", err);
-					return;
-				}
-
-				/* Move to next interval in the sequence */
-				//interval_index = (interval_index + 1) % ARRAY_SIZE(test_intervals);
-				initiate_conn_rate_update = false;
-			}
-		}
 	}
 }
 
