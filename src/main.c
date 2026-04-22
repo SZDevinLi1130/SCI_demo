@@ -30,7 +30,9 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 #define INTERVAL_INITIAL	  0x8	 /* 8 units, 10 ms */
 #define INTERVAL_INITIAL_US	  10000 /* 10 ms */
-#define INTERVAL_TARGET_US	  750
+#define INTERVAL_TARGET_US	  1000
+#define LATENCY_RESPONSE_TIMEOUT_MS 50
+#define LATENCY_REPORT_INTERVAL 64
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -86,6 +88,8 @@ static K_SEM_DEFINE(min_interval_read_sem, 0, 1);
 static K_SEM_DEFINE(frame_space_updated_sem, 0, 1);
 static K_SEM_DEFINE(discovery_complete_sem, 0, 1);
 static K_SEM_DEFINE(role_selected_sem, 0, 1);
+static K_SEM_DEFINE(conn_rate_changed_sem, 0, 1);
+static K_SEM_DEFINE(latency_response_sem, 0, 1);
 
 static bool test_ready;
 static bool initiate_conn_rate_update = true;
@@ -93,6 +97,10 @@ static bool conn_rate_update_pending = true;
 static bool is_central;
 
 static uint32_t latency_response;
+static uint32_t latency_sum_us;
+static uint32_t latency_min_us;
+static uint32_t latency_max_us;
+static uint32_t latency_sample_count;
 
 static uint16_t local_min_interval_us;
 static uint16_t remote_min_interval_us;
@@ -105,6 +113,35 @@ static struct bt_latency_client latency_client;
 static struct bt_le_conn_param *conn_param =
 	BT_LE_CONN_PARAM(INTERVAL_INITIAL, INTERVAL_INITIAL, 0, 400);
 static struct bt_conn_info conn_info = {0};
+
+static void latency_stats_reset(void)
+{
+	latency_sum_us = 0;
+	latency_min_us = 0;
+	latency_max_us = 0;
+	latency_sample_count = 0;
+}
+
+static void latency_stats_add(uint32_t latency_us)
+{
+	if (latency_sample_count == 0U) {
+		latency_min_us = latency_us;
+		latency_max_us = latency_us;
+	} else {
+		latency_min_us = MIN(latency_min_us, latency_us);
+		latency_max_us = MAX(latency_max_us, latency_us);
+	}
+
+	latency_sum_us += latency_us;
+	latency_sample_count++;
+
+	if (latency_sample_count >= LATENCY_REPORT_INTERVAL) {
+		LOG_INF("Latency avg %u us, min %u us, max %u us, jitter %u us",
+			latency_sum_us / latency_sample_count, latency_min_us, latency_max_us,
+			latency_max_us - latency_min_us);
+		latency_stats_reset();
+	}
+}
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -480,6 +517,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	common_min_interval_us = 0;
 	remote_min_interval_handle = 0;
 	requested_interval_us = MAX((uint32_t)local_min_interval_us, (uint32_t)INTERVAL_TARGET_US);
+	latency_response = 0;
+	latency_stats_reset();
+	k_sem_reset(&conn_rate_changed_sem);
+	k_sem_reset(&latency_response_sem);
 
 	default_conn = bt_conn_ref(conn);
 	err = bt_conn_get_info(default_conn, &conn_info);
@@ -523,6 +564,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	test_ready = false;
 	conn_rate_update_pending = true;
+	latency_response = 0;
+	latency_stats_reset();
+	k_sem_reset(&conn_rate_changed_sem);
+	k_sem_reset(&latency_response_sem);
 
 	if (default_conn) {
 		bt_conn_unref(default_conn);
@@ -574,7 +619,7 @@ static int set_conn_rate_defaults(uint32_t interval_min_us, uint32_t interval_ma
 		.interval_max_125us = interval_max_us / 125,
 		.subrate_min = 1,
 		.subrate_max = 1,
-		.max_latency = 5,
+		.max_latency = 0,
 		.continuation_number = 0,
 		.supervision_timeout_10ms = 400,
 		.min_ce_len_125us = BT_HCI_LE_SCI_CE_LEN_MIN_125US,
@@ -596,7 +641,7 @@ static int set_conn_rate_defaults(uint32_t interval_min_us, uint32_t interval_ma
 static int select_lowest_frame_space(void)
 {
 	const struct bt_conn_le_frame_space_update_param params = {
-		.phys = BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_2M_MASK,
+		.phys = BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_1M_MASK,
 		.spacing_types = BT_CONN_LE_FRAME_SPACE_TYPES_MASK_ACL_IFS,
 		.frame_space_min = 0,
 		.frame_space_max = 150,
@@ -654,15 +699,17 @@ static void conn_rate_changed(struct bt_conn *conn, uint8_t status,
 		LOG_WRN("Connection rate change failed (HCI status 0x%02x %s)", status,
 			bt_hci_err_to_str(status));
 	}
+
+	k_sem_give(&conn_rate_changed_sem);
 }
 
-static int update_to_2m_phy(void)
+static int update_to_1m_phy(void)
 {
 	struct bt_conn_le_phy_param phy;
 
 	phy.options = BT_CONN_LE_PHY_OPT_NONE;
-	phy.pref_rx_phy = BT_GAP_LE_PHY_2M;
-	phy.pref_tx_phy = BT_GAP_LE_PHY_2M;
+	phy.pref_rx_phy = BT_GAP_LE_PHY_1M;
+	phy.pref_tx_phy = BT_GAP_LE_PHY_1M;
 
 	int err = bt_conn_le_phy_update(default_conn, &phy);
 
@@ -710,6 +757,8 @@ static void latency_response_handler(const void *buf, uint16_t len)
 
 		latency_response = (uint32_t)k_cyc_to_ns_floor64(cycles_spent) / 2000;
 	}
+
+	k_sem_give(&latency_response_sem);
 }
 
 static const struct bt_latency_client_cb latency_client_cb = {.latency_response =
@@ -725,16 +774,20 @@ static void test_run(void)
 	}
 
 	test_ready = false;
+	latency_stats_reset();
+
+	if (!initiate_conn_rate_update) {
+		return;
+	}
 
 	/* Update link parameters to satisfy minimum supported connection interval requirements. */
 	if (initiate_conn_rate_update) {
-		/* The lowest connection intervals can only be achieved on the 2M PHY. */
-		err = update_to_2m_phy();
+		err = update_to_1m_phy();
 		if (err) {
 			return;
 		}
 
-		/* A smaller frame space is required. */
+		/* Negotiate the smallest supported frame space for the selected PHY. */
 		err = select_lowest_frame_space();
 		if (err) {
 			LOG_WRN("Frame space update failed (err %d)", err);
@@ -762,10 +815,17 @@ static void test_run(void)
 
 	if (initiate_conn_rate_update && conn_rate_update_pending) {
 		LOG_INF("Requesting new connection interval: %u us", requested_interval_us);
+		k_sem_reset(&conn_rate_changed_sem);
 
 		err = conn_rate_request(requested_interval_us, requested_interval_us);
 		if (err) {
 			LOG_WRN("Connection rate update failed (err %d)", err);
+			return;
+		}
+
+		err = k_sem_take(&conn_rate_changed_sem, K_MSEC(LATENCY_RESPONSE_TIMEOUT_MS));
+		if (err) {
+			LOG_WRN("Timed out waiting for connection rate change");
 			return;
 		}
 
@@ -776,19 +836,25 @@ static void test_run(void)
 	while (default_conn) {
 		uint32_t time = k_cycle_get_32();
 
+		k_sem_reset(&latency_response_sem);
+		latency_response = 0;
 		gpio_pin_set_dt(&led1, 1);
 		err = bt_latency_request(&latency_client, &time, sizeof(time));
 		if (err && err != -EALREADY) {
 			LOG_WRN("Latency failed (err %d)", err);
 			gpio_pin_set_dt(&led1, 0);
-			k_sleep(K_MSEC(200));
 			continue;
 		}
 
-		k_sleep(K_MSEC(200)); /* wait for latency response */
+		err = k_sem_take(&latency_response_sem, K_MSEC(LATENCY_RESPONSE_TIMEOUT_MS));
+		if (err) {
+			gpio_pin_set_dt(&led1, 0);
+			LOG_WRN("Did not receive a latency response");
+			continue;
+		}
 
 		if (latency_response) {
-			LOG_INF("Transmission Latency: %u us", latency_response);
+			latency_stats_add(latency_response);
 		} else {
 			LOG_WRN("Did not receive a latency response");
 			gpio_pin_set_dt(&led1, 0);
@@ -902,11 +968,13 @@ int main(void)
 
 	if (selected_role == ROLE_SELECTION_CENTRAL) {
 		is_central = true;
+		initiate_conn_rate_update = true;
 		LOG_INF("Central. Starting scanning");
 		scan_init();
 		scan_start();
 	} else {
 		is_central = false;
+		initiate_conn_rate_update = false;
 		LOG_INF("Peripheral. Starting advertising");
 		adv_start();
 	}
