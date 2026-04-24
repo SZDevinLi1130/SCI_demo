@@ -814,10 +814,26 @@ static void test_run(void)
 	}
 
 	if (initiate_conn_rate_update && conn_rate_update_pending) {
-		LOG_INF("Requesting new connection interval: %u us", requested_interval_us);
+		uint32_t request_min_us = requested_interval_us;
+		uint32_t request_max_us = requested_interval_us;
+
+		/* On 1M PHY, the controller may not support every 125 us step up to the
+		 * target interval. Request a bounded range so it can select the best value
+		 * that stays at or below the 1 ms ceiling.
+		 */
+		if (common_min_interval_us != 0U && common_min_interval_us < requested_interval_us) {
+			request_min_us = common_min_interval_us;
+		}
+
+		if (request_min_us == request_max_us) {
+			LOG_INF("Requesting new connection interval: %u us", request_max_us);
+		} else {
+			LOG_INF("Requesting new connection interval range: %u us to %u us",
+				request_min_us, request_max_us);
+		}
 		k_sem_reset(&conn_rate_changed_sem);
 
-		err = conn_rate_request(requested_interval_us, requested_interval_us);
+		err = conn_rate_request(request_min_us, request_max_us);
 		if (err) {
 			LOG_WRN("Connection rate update failed (err %d)", err);
 			return;
