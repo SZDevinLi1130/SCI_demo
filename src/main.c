@@ -6,6 +6,8 @@
 
 #include <zephyr/console/console.h>
 #include <string.h>
+#include <zephyr/net_buf.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
@@ -17,10 +19,12 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <bluetooth/hci_vs_sdc.h>
 #include <bluetooth/services/latency.h>
 #include <bluetooth/services/latency_client.h>
 #include <bluetooth/scan.h>
 #include <bluetooth/gatt_dm.h>
+#include <sdc_hci_cmd_controller_baseband.h>
 #include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
@@ -31,8 +35,12 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define INTERVAL_INITIAL	  0x8	 /* 8 units, 10 ms */
 #define INTERVAL_INITIAL_US	  10000 /* 10 ms */
 #define INTERVAL_TARGET_US	  1000
+#define INTERVAL_1M_PHY_MIN_US 1250
 #define LATENCY_RESPONSE_TIMEOUT_MS 50
+#define CONN_RATE_CHANGE_TIMEOUT_MS 1000
 #define LATENCY_REPORT_INTERVAL 64
+#define ACL_AUTO_FLUSH_TIMEOUT_625US 4U
+#define QOS_BACKOFF_MAX_MS 4U
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -101,11 +109,18 @@ static uint32_t latency_sum_us;
 static uint32_t latency_min_us;
 static uint32_t latency_max_us;
 static uint32_t latency_sample_count;
+static atomic_t qos_crc_ok_count;
+static atomic_t qos_crc_error_count;
+static atomic_t qos_tx_backoff_ms;
 
 static uint16_t local_min_interval_us;
 static uint16_t remote_min_interval_us;
 static uint16_t common_min_interval_us;
 static uint16_t remote_min_interval_handle;
+static uint32_t active_conn_interval_us = INTERVAL_INITIAL_US;
+static uint8_t conn_rate_change_status = BT_HCI_ERR_UNSPECIFIED;
+static struct bt_conn_le_min_conn_interval_info local_min_interval_info;
+static bool local_min_interval_groups_valid;
 
 static struct bt_conn *default_conn;
 static struct bt_latency latency;
@@ -114,12 +129,19 @@ static struct bt_le_conn_param *conn_param =
 	BT_LE_CONN_PARAM(INTERVAL_INITIAL, INTERVAL_INITIAL, 0, 400);
 static struct bt_conn_info conn_info = {0};
 
+static void qos_stats_reset(void)
+{
+	atomic_set(&qos_crc_ok_count, 0);
+	atomic_set(&qos_crc_error_count, 0);
+}
+
 static void latency_stats_reset(void)
 {
 	latency_sum_us = 0;
 	latency_min_us = 0;
 	latency_max_us = 0;
 	latency_sample_count = 0;
+	qos_stats_reset();
 }
 
 static void latency_stats_add(uint32_t latency_us)
@@ -136,11 +158,104 @@ static void latency_stats_add(uint32_t latency_us)
 	latency_sample_count++;
 
 	if (latency_sample_count >= LATENCY_REPORT_INTERVAL) {
-		LOG_INF("Latency avg %u us, min %u us, max %u us, jitter %u us",
+		LOG_INF("Latency avg %u us, min %u us, max %u us, jitter %u us, QoS crc ok %u, "
+			"crc err %u, backoff %u ms",
 			latency_sum_us / latency_sample_count, latency_min_us, latency_max_us,
-			latency_max_us - latency_min_us);
+			latency_max_us - latency_min_us,
+			(uint32_t)atomic_get(&qos_crc_ok_count),
+			(uint32_t)atomic_get(&qos_crc_error_count),
+			(uint32_t)atomic_get(&qos_tx_backoff_ms));
 		latency_stats_reset();
 	}
+}
+
+static int set_acl_auto_flush_timeout(struct bt_conn *conn, uint16_t flush_timeout_625us)
+{
+	struct net_buf *buf;
+	struct net_buf *rsp = NULL;
+	sdc_hci_cmd_cb_write_automatic_flush_timeout_t *cmd;
+	uint16_t conn_handle;
+	int err;
+
+	err = bt_hci_get_conn_handle(conn, &conn_handle);
+	if (err) {
+		LOG_WRN("Failed to get connection handle for flush timeout (err %d)", err);
+		return err;
+	}
+
+	buf = bt_hci_cmd_alloc(K_MSEC(LATENCY_RESPONSE_TIMEOUT_MS));
+	if (!buf) {
+		LOG_WRN("Failed to allocate HCI command buffer for flush timeout");
+		return -ENOMEM;
+	}
+
+	cmd = net_buf_add(buf, sizeof(*cmd));
+	cmd->conn_handle = sys_cpu_to_le16(conn_handle);
+	cmd->flush_timeout = sys_cpu_to_le16(flush_timeout_625us);
+
+	err = bt_hci_cmd_send_sync(SDC_HCI_OPCODE_CMD_CB_WRITE_AUTOMATIC_FLUSH_TIMEOUT, buf, &rsp);
+	if (rsp) {
+		net_buf_unref(rsp);
+	}
+
+	if (err) {
+		LOG_WRN("Failed to write ACL auto flush timeout (err %d)", err);
+		return err;
+	}
+
+	LOG_INF("ACL auto flush timeout set to %u us", (uint32_t)flush_timeout_625us * 625U);
+	return 0;
+}
+
+static bool qos_vs_evt_handler(struct net_buf_simple *buf)
+{
+	uint8_t subevent_code;
+	sdc_hci_subevent_vs_qos_conn_event_report_t *evt;
+	uint32_t current_backoff_ms;
+
+	subevent_code = net_buf_simple_pull_u8(buf);
+	if (subevent_code != SDC_HCI_SUBEVENT_VS_QOS_CONN_EVENT_REPORT) {
+		return false;
+	}
+
+	evt = (void *)buf->data;
+	atomic_add(&qos_crc_ok_count, evt->crc_ok_count);
+	atomic_add(&qos_crc_error_count, evt->crc_error_count);
+
+	current_backoff_ms = (uint32_t)atomic_get(&qos_tx_backoff_ms);
+	if (evt->crc_error_count != 0U) {
+		uint32_t next_backoff_ms = MIN(QOS_BACKOFF_MAX_MS,
+			current_backoff_ms + (uint32_t)evt->crc_error_count);
+
+		atomic_set(&qos_tx_backoff_ms, (atomic_val_t)next_backoff_ms);
+	} else if ((evt->crc_ok_count != 0U) && (current_backoff_ms != 0U)) {
+		atomic_set(&qos_tx_backoff_ms, (atomic_val_t)(current_backoff_ms - 1U));
+	}
+
+	return true;
+}
+
+static int enable_qos_conn_event_reporting(void)
+{
+	sdc_hci_cmd_vs_qos_conn_event_report_enable_t cmd_enable = {
+		.enable = true,
+	};
+	int err;
+
+	err = bt_hci_register_vnd_evt_cb(qos_vs_evt_handler);
+	if (err) {
+		LOG_WRN("Failed to register QoS VS callback (err %d)", err);
+		return err;
+	}
+
+	err = hci_vs_sdc_qos_conn_event_report_enable(&cmd_enable);
+	if (err) {
+		LOG_WRN("Failed to enable QoS connection event reports (err %d)", err);
+		return err;
+	}
+
+	LOG_INF("Bluetooth LE QoS connection event reporting enabled");
+	return 0;
 }
 
 static const struct bt_data ad[] = {
@@ -519,6 +634,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	requested_interval_us = MAX((uint32_t)local_min_interval_us, (uint32_t)INTERVAL_TARGET_US);
 	latency_response = 0;
 	latency_stats_reset();
+	atomic_set(&qos_tx_backoff_ms, 0);
 	k_sem_reset(&conn_rate_changed_sem);
 	k_sem_reset(&latency_response_sem);
 
@@ -539,6 +655,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	LOG_INF("Connected as %s",
 		conn_info.role == BT_CONN_ROLE_CENTRAL ? "central" : "peripheral");
 	LOG_INF("Conn. interval is %u us", conn_info.le.interval_us);
+	active_conn_interval_us = conn_info.le.interval_us;
+
+	err = set_acl_auto_flush_timeout(default_conn, ACL_AUTO_FLUSH_TIMEOUT_625US);
+	if (err) {
+		LOG_WRN("LE Flushable ACL Data remains at controller default timeout");
+	}
 
 #if defined(CONFIG_BT_SMP)
 	if (conn_info.role == BT_CONN_ROLE_PERIPHERAL) {
@@ -566,6 +688,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	conn_rate_update_pending = true;
 	latency_response = 0;
 	latency_stats_reset();
+	atomic_set(&qos_tx_backoff_ms, 0);
+	active_conn_interval_us = INTERVAL_INITIAL_US;
 	k_sem_reset(&conn_rate_changed_sem);
 	k_sem_reset(&latency_response_sem);
 
@@ -612,6 +736,88 @@ static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 	return false;
 }
 
+static void log_local_min_interval_groups(void)
+{
+	if (!local_min_interval_groups_valid) {
+		return;
+	}
+
+	if (local_min_interval_info.num_groups == 0U) {
+		LOG_INF("Local SCI interval groups unavailable; controller reports rounded values only");
+		return;
+	}
+
+	for (uint8_t index = 0U; index < local_min_interval_info.num_groups; index++) {
+		const struct bt_conn_le_min_conn_interval_group *group =
+			&local_min_interval_info.groups[index];
+
+		LOG_INF("Local SCI group %u: %u us to %u us step %u us", index,
+			group->min_125us * 125U, group->max_125us * 125U,
+			group->stride_125us * 125U);
+	}
+}
+
+static uint32_t first_group_interval_in_range_us(
+	const struct bt_conn_le_min_conn_interval_group *group, uint32_t range_min_us,
+	uint32_t range_max_us)
+{
+	uint32_t group_min_us = group->min_125us * 125U;
+	uint32_t group_max_us = group->max_125us * 125U;
+	uint32_t stride_us = group->stride_125us * 125U;
+	uint32_t interval_us;
+
+	if ((range_max_us < group_min_us) || (range_min_us > group_max_us)) {
+		return 0U;
+	}
+
+	interval_us = MAX(range_min_us, group_min_us);
+	if (stride_us > 0U) {
+		uint32_t offset_us = interval_us - group_min_us;
+		uint32_t remainder_us = offset_us % stride_us;
+
+		if (remainder_us != 0U) {
+			interval_us += stride_us - remainder_us;
+		}
+	}
+
+	if ((interval_us < range_min_us) || (interval_us > range_max_us) ||
+	    (interval_us > group_max_us)) {
+		return 0U;
+	}
+
+	return interval_us;
+}
+
+static uint32_t select_local_supported_interval_us(uint32_t range_min_us, uint32_t range_max_us)
+{
+	uint32_t selected_interval_us = 0U;
+
+	if (!local_min_interval_groups_valid || (local_min_interval_info.num_groups == 0U)) {
+		return 0U;
+	}
+
+	for (uint8_t index = 0U; index < local_min_interval_info.num_groups; index++) {
+		uint32_t candidate_interval_us = first_group_interval_in_range_us(
+			&local_min_interval_info.groups[index], range_min_us, range_max_us);
+
+		if ((candidate_interval_us != 0U) &&
+		    ((selected_interval_us == 0U) || (candidate_interval_us < selected_interval_us))) {
+			selected_interval_us = candidate_interval_us;
+		}
+	}
+
+	return selected_interval_us;
+}
+
+static uint16_t conn_rate_max_ce_len_125us(uint32_t interval_max_us)
+{
+	uint32_t interval_ce_len_125us = interval_max_us / 125U;
+	uint32_t controller_ce_len_125us = CONFIG_BT_CTLR_SDC_MAX_CONN_EVENT_LEN_DEFAULT / 125U;
+	uint32_t max_ce_len_125us = MIN(interval_ce_len_125us, controller_ce_len_125us);
+
+	return (uint16_t)MAX((uint32_t)BT_HCI_LE_SCI_CE_LEN_MIN_125US, max_ce_len_125us);
+}
+
 static int set_conn_rate_defaults(uint32_t interval_min_us, uint32_t interval_max_us)
 {
 	const struct bt_conn_le_conn_rate_param params = {
@@ -623,7 +829,7 @@ static int set_conn_rate_defaults(uint32_t interval_min_us, uint32_t interval_ma
 		.continuation_number = 0,
 		.supervision_timeout_10ms = 400,
 		.min_ce_len_125us = BT_HCI_LE_SCI_CE_LEN_MIN_125US,
-		.max_ce_len_125us = BT_HCI_LE_SCI_CE_LEN_MAX_125US,
+		.max_ce_len_125us = conn_rate_max_ce_len_125us(interval_max_us),
 	};
 
 	int err = bt_conn_le_conn_rate_set_defaults(&params);
@@ -638,10 +844,10 @@ static int set_conn_rate_defaults(uint32_t interval_min_us, uint32_t interval_ma
 	return 0;
 }
 
-static int select_lowest_frame_space(void)
+static int select_lowest_frame_space(uint8_t phys_mask)
 {
 	const struct bt_conn_le_frame_space_update_param params = {
-		.phys = BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_1M_MASK,
+		.phys = phys_mask,
 		.spacing_types = BT_CONN_LE_FRAME_SPACE_TYPES_MASK_ACL_IFS,
 		.frame_space_min = 0,
 		.frame_space_max = 150,
@@ -670,7 +876,7 @@ static int conn_rate_request(uint32_t interval_min_us, uint32_t interval_max_us)
 		.continuation_number = 0,
 		.supervision_timeout_10ms = 400,
 		.min_ce_len_125us = BT_HCI_LE_SCI_CE_LEN_MIN_125US,
-		.max_ce_len_125us = BT_HCI_LE_SCI_CE_LEN_MAX_125US,
+		.max_ce_len_125us = conn_rate_max_ce_len_125us(interval_max_us),
 	};
 
 	int err = bt_conn_le_conn_rate_request(default_conn, &params);
@@ -683,10 +889,48 @@ static int conn_rate_request(uint32_t interval_min_us, uint32_t interval_max_us)
 	return 0;
 }
 
+static int request_conn_interval_update(uint32_t interval_min_us, uint32_t interval_max_us)
+{
+	int err;
+
+	if (interval_min_us == interval_max_us) {
+		LOG_INF("Requesting new connection interval: %u us", interval_max_us);
+	} else {
+		LOG_INF("Requesting new connection interval range: %u us to %u us",
+			interval_min_us, interval_max_us);
+	}
+
+	k_sem_reset(&conn_rate_changed_sem);
+	conn_rate_change_status = BT_HCI_ERR_UNSPECIFIED;
+
+	err = conn_rate_request(interval_min_us, interval_max_us);
+	if (err) {
+		return err;
+	}
+
+	err = k_sem_take(&conn_rate_changed_sem, K_MSEC(CONN_RATE_CHANGE_TIMEOUT_MS));
+	if (err) {
+		LOG_WRN("Timed out waiting for connection rate change after %u ms",
+			CONN_RATE_CHANGE_TIMEOUT_MS);
+		return err;
+	}
+
+	if (conn_rate_change_status != BT_HCI_ERR_SUCCESS) {
+		LOG_WRN("Connection rate procedure completed with status 0x%02x %s",
+			conn_rate_change_status, bt_hci_err_to_str(conn_rate_change_status));
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static void conn_rate_changed(struct bt_conn *conn, uint8_t status,
 			      const struct bt_conn_le_conn_rate_changed *params)
 {
+	conn_rate_change_status = status;
+
 	if (status == BT_HCI_ERR_SUCCESS) {
+		active_conn_interval_us = params->interval_us;
 		LOG_INF("Connection rate changed: "
 			"interval %u us, "
 			"subrate factor %d, "
@@ -780,19 +1024,13 @@ static void test_run(void)
 		return;
 	}
 
-	/* Update link parameters to satisfy minimum supported connection interval requirements. */
-	if (initiate_conn_rate_update) {
-		err = update_to_1m_phy();
-		if (err) {
-			return;
-		}
-
-		/* Negotiate the smallest supported frame space for the selected PHY. */
-		err = select_lowest_frame_space();
-		if (err) {
-			LOG_WRN("Frame space update failed (err %d)", err);
-			return;
-		}
+	/* SCI needs the reduced frame space before the controller evaluates the
+	 * request. Do that on the 2M path first, then switch to 1M after SCI succeeds.
+	 */
+	err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_2M_MASK);
+	if (err) {
+		LOG_WRN("2M frame space update failed (err %d)", err);
+		return;
 	}
 
 	/* Read remote min interval if characteristic was found */
@@ -825,32 +1063,85 @@ static void test_run(void)
 			request_min_us = common_min_interval_us;
 		}
 
-		if (request_min_us == request_max_us) {
-			LOG_INF("Requesting new connection interval: %u us", request_max_us);
-		} else {
-			LOG_INF("Requesting new connection interval range: %u us to %u us",
-				request_min_us, request_max_us);
-		}
-		k_sem_reset(&conn_rate_changed_sem);
+		if (local_min_interval_groups_valid) {
+			uint32_t supported_interval_us =
+				select_local_supported_interval_us(request_min_us, request_max_us);
 
-		err = conn_rate_request(request_min_us, request_max_us);
+			if (supported_interval_us == 0U) {
+				LOG_WRN("No local SCI interval supported in range %u us to %u us",
+					request_min_us, request_max_us);
+				return;
+			}
+
+			request_min_us = supported_interval_us;
+			request_max_us = supported_interval_us;
+			LOG_INF("Selected local supported SCI interval: %u us", supported_interval_us);
+		}
+
+		err = request_conn_interval_update(request_min_us, request_max_us);
 		if (err) {
 			LOG_WRN("Connection rate update failed (err %d)", err);
-			return;
-		}
-
-		err = k_sem_take(&conn_rate_changed_sem, K_MSEC(LATENCY_RESPONSE_TIMEOUT_MS));
-		if (err) {
-			LOG_WRN("Timed out waiting for connection rate change");
 			return;
 		}
 
 		conn_rate_update_pending = false;
 	}
 
+	if (active_conn_interval_us <= INTERVAL_TARGET_US) {
+		uint32_t phy_switch_interval_us = INTERVAL_1M_PHY_MIN_US;
+		bool keep_current_phy = false;
+
+		if (local_min_interval_groups_valid) {
+			phy_switch_interval_us =
+				select_local_supported_interval_us(INTERVAL_1M_PHY_MIN_US, INTERVAL_INITIAL_US);
+		}
+
+		if (phy_switch_interval_us == 0U) {
+			LOG_WRN("No local SCI interval above 1 ms available for 1M PHY transition; keeping current PHY");
+			keep_current_phy = true;
+		} else {
+			LOG_INF("Requesting wider connection interval before 1M PHY switch: %u us",
+				phy_switch_interval_us);
+
+			err = request_conn_interval_update(phy_switch_interval_us, phy_switch_interval_us);
+			if (err) {
+				LOG_WRN("Keeping current PHY because the >1 ms interval request failed (err %d)",
+					err);
+				keep_current_phy = true;
+			}
+		}
+
+		if (keep_current_phy) {
+			goto latency_loop;
+		}
+	}
+
+	/* Apply the 1M PHY path after the SCI procedure completes. Requesting SCI while
+	 * already on 1M causes the controller to reject 750 us with opcode 0x20a1 status 0x11.
+	 */
+		err = update_to_1m_phy();
+		if (err) {
+			LOG_WRN("Keeping current PHY after 1M update failure (err %d)", err);
+			goto latency_loop;
+		}
+
+	/* Negotiate the smallest supported frame space for the selected PHY. */
+		err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_1M_MASK);
+		if (err) {
+			LOG_WRN("Keeping current PHY after 1M frame space update failure (err %d)", err);
+			goto latency_loop;
+		}
+
+latency_loop:
+
 	/* Start sending timestamps to the peer device */
 	while (default_conn) {
 		uint32_t time = k_cycle_get_32();
+		uint32_t qos_backoff_ms = (uint32_t)atomic_get(&qos_tx_backoff_ms);
+
+		if (qos_backoff_ms != 0U) {
+			k_sleep(K_MSEC(qos_backoff_ms));
+		}
 
 		k_sem_reset(&latency_response_sem);
 		latency_response = 0;
@@ -921,11 +1212,25 @@ int main(void)
 
 	LOG_INF("Bluetooth initialized");
 
-	/* Read local minimum connection interval */
-	err = bt_conn_le_read_min_conn_interval(&local_min_interval_us);
+	err = enable_qos_conn_event_reporting();
 	if (err) {
-		LOG_WRN("Failed to read min conn interval (err %d)", err);
-		return 0;
+		LOG_WRN("Bluetooth LE QoS reporting unavailable (err %d)", err);
+	}
+
+	err = bt_conn_le_read_min_conn_interval_groups(&local_min_interval_info);
+	if (err) {
+		LOG_WRN("Failed to read local SCI interval groups (err %d)", err);
+
+		/* Fall back to the minimum-only query when interval groups are unavailable. */
+		err = bt_conn_le_read_min_conn_interval(&local_min_interval_us);
+		if (err) {
+			LOG_WRN("Failed to read min conn interval (err %d)", err);
+			return 0;
+		}
+	} else {
+		local_min_interval_us = local_min_interval_info.min_supported_conn_interval_us;
+		local_min_interval_groups_valid = true;
+		log_local_min_interval_groups();
 	}
 	LOG_INF("Local minimum connection interval: %u us", local_min_interval_us);
 
