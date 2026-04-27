@@ -19,6 +19,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
+#include <zephyr/drivers/timer/nrf_grtc_timer.h>
 #include <bluetooth/hci_vs_sdc.h>
 #include <bluetooth/services/latency.h>
 #include <bluetooth/services/latency_client.h>
@@ -35,17 +36,22 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define INTERVAL_INITIAL	  0x8	 /* 8 units, 10 ms */
 #define INTERVAL_INITIAL_US	  10000 /* 10 ms */
 #define INTERVAL_TARGET_US	  1000
+#define INTERVAL_2M_PHY_MODE_US 750
 #define INTERVAL_1M_PHY_MIN_US 1250
 #define LATENCY_RESPONSE_TIMEOUT_MS 50
 #define CONN_RATE_CHANGE_TIMEOUT_MS 1000
-#define LATENCY_REPORT_INTERVAL 64
+#define LATENCY_REPORT_INTERVAL 200//64
 #define ACL_AUTO_FLUSH_TIMEOUT_625US 4U
 #define QOS_BACKOFF_MAX_MS 4U
+#define LATENCY_PREPARE_DISTANCE_MIN_US 125U
+#define LATENCY_PREPARE_DISTANCE_MAX_US 200U
+#define LATENCY_PREPARE_DISTANCE_DIVISOR 8U
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
 
 enum role_selection {
 	ROLE_SELECTION_NONE,
@@ -53,11 +59,18 @@ enum role_selection {
 	ROLE_SELECTION_CENTRAL,
 };
 
+enum link_profile {
+	LINK_PROFILE_UNKNOWN,
+	LINK_PROFILE_750US_2M,
+	LINK_PROFILE_1250US_1M,
+};
+
 #define ROLE_INPUT_THREAD_STACK_SIZE 1024
 #define ROLE_INPUT_THREAD_PRIORITY 7
 
 static struct gpio_callback button0_cb_data;
 static struct gpio_callback button1_cb_data;
+static struct gpio_callback button3_cb_data;
 static volatile enum role_selection selected_role = ROLE_SELECTION_NONE;
 K_THREAD_STACK_DEFINE(role_input_thread_stack, ROLE_INPUT_THREAD_STACK_SIZE);
 static struct k_thread role_input_thread_data;
@@ -98,6 +111,7 @@ static K_SEM_DEFINE(discovery_complete_sem, 0, 1);
 static K_SEM_DEFINE(role_selected_sem, 0, 1);
 static K_SEM_DEFINE(conn_rate_changed_sem, 0, 1);
 static K_SEM_DEFINE(latency_response_sem, 0, 1);
+static K_SEM_DEFINE(latency_request_slot_sem, 0, 1);
 
 static bool test_ready;
 static bool initiate_conn_rate_update = true;
@@ -112,6 +126,10 @@ static uint32_t latency_sample_count;
 static atomic_t qos_crc_ok_count;
 static atomic_t qos_crc_error_count;
 static atomic_t qos_tx_backoff_ms;
+static atomic_t requested_link_profile;
+static atomic_t link_profile_switch_pending;
+static atomic_t link_profile_switch_enabled;
+static atomic_t latency_request_reference_cycle;
 
 static uint16_t local_min_interval_us;
 static uint16_t remote_min_interval_us;
@@ -121,6 +139,7 @@ static uint32_t active_conn_interval_us = INTERVAL_INITIAL_US;
 static uint8_t conn_rate_change_status = BT_HCI_ERR_UNSPECIFIED;
 static struct bt_conn_le_min_conn_interval_info local_min_interval_info;
 static bool local_min_interval_groups_valid;
+static enum link_profile active_link_profile = LINK_PROFILE_UNKNOWN;
 
 static struct bt_conn *default_conn;
 static struct bt_latency latency;
@@ -128,6 +147,113 @@ static struct bt_latency_client latency_client;
 static struct bt_le_conn_param *conn_param =
 	BT_LE_CONN_PARAM(INTERVAL_INITIAL, INTERVAL_INITIAL, 0, 400);
 static struct bt_conn_info conn_info = {0};
+
+static void latency_led_off_work_handler(struct k_work *work);
+static void latency_request_slot_timer_handler(struct k_timer *timer);
+static K_WORK_DELAYABLE_DEFINE(latency_led_off_work, latency_led_off_work_handler);
+static K_TIMER_DEFINE(latency_request_slot_timer, latency_request_slot_timer_handler, NULL);
+
+static uint32_t latency_prepare_distance_us_get(uint32_t conn_interval_us)
+{
+	uint32_t prepare_distance_us;
+
+	if (conn_interval_us <= 1U) {
+		return 0U;
+	}
+
+	prepare_distance_us = conn_interval_us / LATENCY_PREPARE_DISTANCE_DIVISOR;
+	prepare_distance_us = CLAMP(prepare_distance_us, LATENCY_PREPARE_DISTANCE_MIN_US,
+		LATENCY_PREPARE_DISTANCE_MAX_US);
+
+	return MIN(prepare_distance_us, conn_interval_us - 1U);
+}
+
+static void latency_request_prepare_handler(struct bt_conn *conn)
+{
+	uint32_t prepare_distance_us;
+
+	if (!is_central || !default_conn ||
+	    (conn != default_conn) ||
+	    (atomic_get(&link_profile_switch_enabled) == 0)) {
+		return;
+	}
+
+	prepare_distance_us = latency_prepare_distance_us_get(active_conn_interval_us);
+	if (prepare_distance_us == 0U) {
+		return;
+	}
+
+	atomic_set(&latency_request_reference_cycle,
+		(atomic_val_t)(k_cycle_get_32() + k_us_to_cyc_ceil32(prepare_distance_us)));
+	k_sem_give(&latency_request_slot_sem);
+}
+
+static void latency_request_slot_timer_handler(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	latency_request_prepare_handler(default_conn);
+}
+
+static void latency_request_received_handler(const void *buf, uint16_t len)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(len);
+
+	if (is_central || !default_conn) {
+		return;
+	}
+
+	gpio_pin_set_dt(&led1, 1);
+	k_work_reschedule(&latency_led_off_work, K_USEC(active_conn_interval_us));
+}
+
+static const struct bt_latency_cb latency_service_cb = {
+	.latency_request = latency_request_received_handler,
+};
+
+static void latency_led_off_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	gpio_pin_set_dt(&led1, 0);
+}
+
+static bool anchor_point_vs_evt_handler(struct net_buf_simple *buf)
+{
+	sdc_hci_subevent_vs_conn_anchor_point_update_report_t *evt;
+	struct bt_conn *conn;
+	uint32_t conn_interval_us;
+	uint32_t prepare_distance_us;
+	uint64_t timer_trigger_us;
+
+	(void)net_buf_simple_pull_u8(buf);
+	evt = (void *)buf->data;
+
+	conn = bt_hci_conn_lookup_handle(evt->conn_handle);
+	if (!conn) {
+		return true;
+	}
+
+	if (conn != default_conn) {
+		bt_conn_unref(conn);
+		return true;
+	}
+
+	conn_interval_us = active_conn_interval_us;
+	bt_conn_unref(conn);
+
+	prepare_distance_us = latency_prepare_distance_us_get(conn_interval_us);
+	if (prepare_distance_us == 0U) {
+		return true;
+	}
+
+	timer_trigger_us = evt->anchor_point_us + conn_interval_us - prepare_distance_us;
+	timer_trigger_us -= z_nrf_grtc_timer_startup_value_get();
+
+	k_timer_start(&latency_request_slot_timer, K_TIMEOUT_ABS_US(timer_trigger_us),
+		K_USEC(conn_interval_us));
+
+	return true;
+}
 
 static void qos_stats_reset(void)
 {
@@ -235,16 +361,40 @@ static bool qos_vs_evt_handler(struct net_buf_simple *buf)
 	return true;
 }
 
-static int enable_qos_conn_event_reporting(void)
+static bool vs_evt_handler(struct net_buf_simple *buf)
+{
+	uint8_t subevent_code;
+
+	if (buf->len == 0U) {
+		return false;
+	}
+
+	subevent_code = buf->data[0];
+
+	if (subevent_code == SDC_HCI_SUBEVENT_VS_QOS_CONN_EVENT_REPORT) {
+		return qos_vs_evt_handler(buf);
+	}
+
+	if (subevent_code == SDC_HCI_SUBEVENT_VS_CONN_ANCHOR_POINT_UPDATE_REPORT) {
+		return anchor_point_vs_evt_handler(buf);
+	}
+
+	return false;
+}
+
+static int enable_vs_event_reporting(void)
 {
 	sdc_hci_cmd_vs_qos_conn_event_report_enable_t cmd_enable = {
 		.enable = true,
 	};
+	sdc_hci_cmd_vs_conn_anchor_point_update_event_report_enable_t anchor_cmd_enable = {
+		.enable = true,
+	};
 	int err;
 
-	err = bt_hci_register_vnd_evt_cb(qos_vs_evt_handler);
+	err = bt_hci_register_vnd_evt_cb(vs_evt_handler);
 	if (err) {
-		LOG_WRN("Failed to register QoS VS callback (err %d)", err);
+		LOG_WRN("Failed to register VS callback (err %d)", err);
 		return err;
 	}
 
@@ -254,7 +404,13 @@ static int enable_qos_conn_event_reporting(void)
 		return err;
 	}
 
-	LOG_INF("Bluetooth LE QoS connection event reporting enabled");
+	err = hci_vs_sdc_conn_anchor_point_update_event_report_enable(&anchor_cmd_enable);
+	if (err) {
+		LOG_WRN("Failed to enable connection anchor point update reports (err %d)", err);
+		return err;
+	}
+
+	LOG_INF("Bluetooth LE QoS and anchor-point event reporting enabled");
 	return 0;
 }
 
@@ -266,6 +422,18 @@ static const struct bt_data ad[] = {
 static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
+
+static const char *link_profile_to_str(enum link_profile profile)
+{
+	switch (profile) {
+	case LINK_PROFILE_750US_2M:
+		return "750 us + 2M PHY";
+	case LINK_PROFILE_1250US_1M:
+		return "1250 us + 1M PHY";
+	default:
+		return "Unknown";
+	}
+}
 
 /* Example GATT service for exchanging minimum supported connection interval. */
 static ssize_t read_min_interval(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
@@ -377,6 +545,26 @@ static bool try_select_role(enum role_selection role)
 	return true;
 }
 
+static void request_link_profile_toggle(void)
+{
+	enum link_profile next_profile;
+
+	if (selected_role != ROLE_SELECTION_CENTRAL ||
+	    atomic_get(&link_profile_switch_enabled) == 0) {
+		return;
+	}
+
+	next_profile = (enum link_profile)atomic_get(&requested_link_profile);
+	if (next_profile == LINK_PROFILE_750US_2M) {
+		next_profile = LINK_PROFILE_1250US_1M;
+	} else {
+		next_profile = LINK_PROFILE_750US_2M;
+	}
+
+	atomic_set(&requested_link_profile, (atomic_val_t)next_profile);
+	atomic_set(&link_profile_switch_pending, 1);
+}
+
 static void role_button_pressed(const struct device *port, struct gpio_callback *cb,
 				uint32_t pins)
 {
@@ -387,6 +575,8 @@ static void role_button_pressed(const struct device *port, struct gpio_callback 
 		try_select_role(ROLE_SELECTION_PERIPHERAL);
 	} else if (pins & BIT(button1.pin)) {
 		try_select_role(ROLE_SELECTION_CENTRAL);
+	} else if (pins & BIT(button3.pin)) {
+		request_link_profile_toggle();
 	}
 }
 
@@ -423,7 +613,8 @@ static int buttons_init(void)
 {
 	int err;
 
-	if (!gpio_is_ready_dt(&button0) || !gpio_is_ready_dt(&button1)) {
+	if (!gpio_is_ready_dt(&button0) || !gpio_is_ready_dt(&button1) ||
+	    !gpio_is_ready_dt(&button3)) {
 		LOG_ERR("Button device not ready");
 		return -ENODEV;
 	}
@@ -437,6 +628,12 @@ static int buttons_init(void)
 	err = gpio_pin_configure_dt(&button1, GPIO_INPUT);
 	if (err) {
 		LOG_ERR("Failed to configure BUTTON1 (err %d)", err);
+		return err;
+	}
+
+	err = gpio_pin_configure_dt(&button3, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Failed to configure BUTTON3 (err %d)", err);
 		return err;
 	}
 
@@ -454,6 +651,13 @@ static int buttons_init(void)
 		return err;
 	}
 
+	gpio_init_callback(&button3_cb_data, role_button_pressed, BIT(button3.pin));
+	err = gpio_add_callback(button3.port, &button3_cb_data);
+	if (err) {
+		LOG_ERR("Failed to add BUTTON3 callback (err %d)", err);
+		return err;
+	}
+
 	err = gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_TO_ACTIVE);
 	if (err) {
 		LOG_ERR("Failed to enable BUTTON0 interrupt (err %d)", err);
@@ -463,6 +667,12 @@ static int buttons_init(void)
 	err = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
 	if (err) {
 		LOG_ERR("Failed to enable BUTTON1 interrupt (err %d)", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		LOG_ERR("Failed to enable BUTTON3 interrupt (err %d)", err);
 		return err;
 	}
 
@@ -634,9 +844,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	requested_interval_us = MAX((uint32_t)local_min_interval_us, (uint32_t)INTERVAL_TARGET_US);
 	latency_response = 0;
 	latency_stats_reset();
+	k_timer_stop(&latency_request_slot_timer);
+	k_sem_reset(&latency_request_slot_sem);
+	atomic_set(&latency_request_reference_cycle, 0);
 	atomic_set(&qos_tx_backoff_ms, 0);
+	atomic_set(&requested_link_profile, (atomic_val_t)LINK_PROFILE_1250US_1M);
+	atomic_set(&link_profile_switch_pending, 0);
+	atomic_set(&link_profile_switch_enabled, 0);
+	k_work_cancel_delayable(&latency_led_off_work);
 	k_sem_reset(&conn_rate_changed_sem);
 	k_sem_reset(&latency_response_sem);
+	active_link_profile = LINK_PROFILE_UNKNOWN;
 
 	default_conn = bt_conn_ref(conn);
 	err = bt_conn_get_info(default_conn, &conn_info);
@@ -688,10 +906,17 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	conn_rate_update_pending = true;
 	latency_response = 0;
 	latency_stats_reset();
+	k_timer_stop(&latency_request_slot_timer);
+	k_sem_reset(&latency_request_slot_sem);
+	atomic_set(&latency_request_reference_cycle, 0);
 	atomic_set(&qos_tx_backoff_ms, 0);
 	active_conn_interval_us = INTERVAL_INITIAL_US;
+	atomic_set(&link_profile_switch_pending, 0);
+	atomic_set(&link_profile_switch_enabled, 0);
+	k_work_cancel_delayable(&latency_led_off_work);
 	k_sem_reset(&conn_rate_changed_sem);
 	k_sem_reset(&latency_response_sem);
+	active_link_profile = LINK_PROFILE_UNKNOWN;
 
 	if (default_conn) {
 		bt_conn_unref(default_conn);
@@ -924,6 +1149,36 @@ static int request_conn_interval_update(uint32_t interval_min_us, uint32_t inter
 	return 0;
 }
 
+static int resolve_link_profile_interval_us(enum link_profile profile, uint32_t *interval_us)
+{
+	uint32_t target_interval_us;
+
+	if (profile == LINK_PROFILE_750US_2M) {
+		target_interval_us = MAX((uint32_t)common_min_interval_us,
+			(uint32_t)INTERVAL_2M_PHY_MODE_US);
+	} else if (profile == LINK_PROFILE_1250US_1M) {
+		target_interval_us = INTERVAL_1M_PHY_MIN_US;
+	} else {
+		return -EINVAL;
+	}
+
+	if (local_min_interval_groups_valid) {
+		uint32_t supported_interval_us =
+			select_local_supported_interval_us(target_interval_us, target_interval_us);
+
+		if (supported_interval_us == 0U) {
+			LOG_WRN("Requested link profile interval %u us is not in the local SCI groups",
+				target_interval_us);
+			return -ENOTSUP;
+		}
+
+		target_interval_us = supported_interval_us;
+	}
+
+	*interval_us = target_interval_us;
+	return 0;
+}
+
 static void conn_rate_changed(struct bt_conn *conn, uint8_t status,
 			      const struct bt_conn_le_conn_rate_changed *params)
 {
@@ -966,6 +1221,125 @@ static int update_to_1m_phy(void)
 	return 0;
 }
 
+static int update_to_2m_phy(void)
+{
+	struct bt_conn_le_phy_param phy;
+
+	phy.options = BT_CONN_LE_PHY_OPT_NONE;
+	phy.pref_rx_phy = BT_GAP_LE_PHY_2M;
+	phy.pref_tx_phy = BT_GAP_LE_PHY_2M;
+
+	int err = bt_conn_le_phy_update(default_conn, &phy);
+
+	if (err) {
+		LOG_WRN("PHY update failed: %d", err);
+		return err;
+	}
+
+	k_sem_take(&phy_updated, K_FOREVER);
+	return 0;
+}
+
+static int switch_to_750us_2m_profile(void)
+{
+	uint32_t target_interval_us;
+	int err;
+
+	err = resolve_link_profile_interval_us(LINK_PROFILE_750US_2M, &target_interval_us);
+	if (err) {
+		return err;
+	}
+
+	err = update_to_2m_phy();
+	if (err) {
+		return err;
+	}
+
+	err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_2M_MASK);
+	if (err) {
+		return err;
+	}
+
+	err = request_conn_interval_update(target_interval_us, target_interval_us);
+	if (err) {
+		return err;
+	}
+
+	requested_interval_us = target_interval_us;
+	active_link_profile = LINK_PROFILE_750US_2M;
+	return 0;
+}
+
+static int switch_to_1250us_1m_profile(void)
+{
+	uint32_t target_interval_us;
+	int err;
+
+	err = resolve_link_profile_interval_us(LINK_PROFILE_1250US_1M, &target_interval_us);
+	if (err) {
+		return err;
+	}
+
+	err = request_conn_interval_update(target_interval_us, target_interval_us);
+	if (err) {
+		return err;
+	}
+
+	err = update_to_1m_phy();
+	if (err) {
+		return err;
+	}
+
+	err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_1M_MASK);
+	if (err) {
+		return err;
+	}
+
+	requested_interval_us = target_interval_us;
+	active_link_profile = LINK_PROFILE_1250US_1M;
+	return 0;
+}
+
+static void process_pending_link_profile_switch(void)
+{
+	enum link_profile target_profile;
+	int err;
+
+	if (atomic_get(&link_profile_switch_pending) == 0) {
+		return;
+	}
+
+	atomic_set(&link_profile_switch_pending, 0);
+	target_profile = (enum link_profile)atomic_get(&requested_link_profile);
+	if (target_profile == active_link_profile) {
+		return;
+	}
+
+	LOG_INF("Switching link profile to %s", link_profile_to_str(target_profile));
+	if (target_profile == LINK_PROFILE_750US_2M) {
+		err = switch_to_750us_2m_profile();
+	} else if (target_profile == LINK_PROFILE_1250US_1M) {
+		err = switch_to_1250us_1m_profile();
+	} else {
+		err = -EINVAL;
+	}
+
+	if (err) {
+		LOG_WRN("Failed to switch link profile to %s (err %d); keeping %s",
+			link_profile_to_str(target_profile), err,
+			link_profile_to_str(active_link_profile));
+		atomic_set(&requested_link_profile, (atomic_val_t)active_link_profile);
+		return;
+	}
+
+	atomic_set(&requested_link_profile, (atomic_val_t)active_link_profile);
+	k_timer_stop(&latency_request_slot_timer);
+	latency_stats_reset();
+	k_sem_reset(&latency_request_slot_sem);
+	atomic_set(&latency_request_reference_cycle, 0);
+	LOG_INF("Link profile active: %s", link_profile_to_str(active_link_profile));
+}
+
 static void le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
 {
 	LOG_INF("LE PHY updated: TX PHY %s, RX PHY %s", phy_to_str(param->tx_phy),
@@ -992,6 +1366,7 @@ static void frame_space_updated(struct bt_conn *conn,
 static void latency_response_handler(const void *buf, uint16_t len)
 {
 	uint32_t latency_time;
+	k_work_cancel_delayable(&latency_led_off_work);
 	gpio_pin_set_dt(&led1, 0);
 
 	if (len == sizeof(latency_time)) {
@@ -1085,66 +1460,52 @@ static void test_run(void)
 		}
 
 		conn_rate_update_pending = false;
+		active_link_profile = LINK_PROFILE_750US_2M;
+		atomic_set(&requested_link_profile, (atomic_val_t)active_link_profile);
 	}
 
 	if (active_conn_interval_us <= INTERVAL_TARGET_US) {
-		uint32_t phy_switch_interval_us = INTERVAL_1M_PHY_MIN_US;
-		bool keep_current_phy = false;
-
-		if (local_min_interval_groups_valid) {
-			phy_switch_interval_us =
-				select_local_supported_interval_us(INTERVAL_1M_PHY_MIN_US, INTERVAL_INITIAL_US);
-		}
-
-		if (phy_switch_interval_us == 0U) {
-			LOG_WRN("No local SCI interval above 1 ms available for 1M PHY transition; keeping current PHY");
-			keep_current_phy = true;
-		} else {
-			LOG_INF("Requesting wider connection interval before 1M PHY switch: %u us",
-				phy_switch_interval_us);
-
-			err = request_conn_interval_update(phy_switch_interval_us, phy_switch_interval_us);
-			if (err) {
-				LOG_WRN("Keeping current PHY because the >1 ms interval request failed (err %d)",
-					err);
-				keep_current_phy = true;
-			}
-		}
-
-		if (keep_current_phy) {
-			goto latency_loop;
-		}
-	}
-
-	/* Apply the 1M PHY path after the SCI procedure completes. Requesting SCI while
-	 * already on 1M causes the controller to reject 750 us with opcode 0x20a1 status 0x11.
-	 */
-		err = update_to_1m_phy();
+		LOG_INF("Requesting wider connection interval before 1M PHY switch: %u us",
+			INTERVAL_1M_PHY_MIN_US);
+		err = switch_to_1250us_1m_profile();
 		if (err) {
-			LOG_WRN("Keeping current PHY after 1M update failure (err %d)", err);
+			LOG_WRN("Keeping current PHY after 1250 us + 1M transition failure (err %d)",
+				err);
 			goto latency_loop;
 		}
 
-	/* Negotiate the smallest supported frame space for the selected PHY. */
-		err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_1M_MASK);
-		if (err) {
-			LOG_WRN("Keeping current PHY after 1M frame space update failure (err %d)", err);
-			goto latency_loop;
-		}
-
+}
 latency_loop:
+	atomic_set(&link_profile_switch_enabled, 1);
+	k_timer_stop(&latency_request_slot_timer);
+	k_sem_reset(&latency_request_slot_sem);
+	atomic_set(&latency_request_reference_cycle, 0);
 
 	/* Start sending timestamps to the peer device */
 	while (default_conn) {
-		uint32_t time = k_cycle_get_32();
 		uint32_t qos_backoff_ms = (uint32_t)atomic_get(&qos_tx_backoff_ms);
+		uint32_t time;
+
+		process_pending_link_profile_switch();
 
 		if (qos_backoff_ms != 0U) {
 			k_sleep(K_MSEC(qos_backoff_ms));
 		}
 
+		atomic_set(&latency_request_reference_cycle, 0);
+		k_sem_reset(&latency_request_slot_sem);
+		err = k_sem_take(&latency_request_slot_sem, K_MSEC(LATENCY_RESPONSE_TIMEOUT_MS));
+		if (err) {
+			LOG_WRN("Timed out waiting for the next latency request slot");
+			continue;
+		}
+
 		k_sem_reset(&latency_response_sem);
 		latency_response = 0;
+		time = (uint32_t)atomic_get(&latency_request_reference_cycle);
+		if (time == 0U) {
+			time = k_cycle_get_32();
+		}
 		gpio_pin_set_dt(&led1, 1);
 		err = bt_latency_request(&latency_client, &time, sizeof(time));
 		if (err && err != -EALREADY) {
@@ -1212,9 +1573,9 @@ int main(void)
 
 	LOG_INF("Bluetooth initialized");
 
-	err = enable_qos_conn_event_reporting();
+	err = enable_vs_event_reporting();
 	if (err) {
-		LOG_WRN("Bluetooth LE QoS reporting unavailable (err %d)", err);
+		LOG_WRN("Bluetooth LE VS event reporting unavailable (err %d)", err);
 	}
 
 	err = bt_conn_le_read_min_conn_interval_groups(&local_min_interval_info);
@@ -1243,7 +1604,7 @@ int main(void)
 		return 0;
 	}
 
-	err = bt_latency_init(&latency, NULL);
+	err = bt_latency_init(&latency, &latency_service_cb);
 	if (err) {
 		LOG_WRN("Latency service initialization failed (err %d)", err);
 		return 0;
@@ -1291,6 +1652,7 @@ int main(void)
 		is_central = true;
 		initiate_conn_rate_update = true;
 		LOG_INF("Central. Starting scanning");
+		LOG_INF("Press BUTTON3 to toggle between 750 us + 2M PHY and 1250 us + 1M PHY");
 		scan_init();
 		scan_start();
 	} else {
@@ -1307,3 +1669,4 @@ int main(void)
 		test_run();
 	}
 }
+

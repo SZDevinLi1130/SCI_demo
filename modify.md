@@ -32,6 +32,12 @@
 | V18 | request 已成功发出但 50 ms 内未等到回调，要求继续修复 | 为 SCI procedure 增加独立的 `CONN_RATE_CHANGE_TIMEOUT_MS=1000`，不再复用 latency 的 50 ms；同时记录 `conn_rate_changed` 的实际 status，避免“事件晚到/失败”被误判成同一种错误 | 已修复并完成编译验证；待双板回归 |
 | V19 | SCI 已成功切到 750 us，但后续切 1M PHY 失败，要求继续修复 | 记录当前生效 interval；当 controller 已接受 `<= 1 ms` 的最短 SCI interval 时，不再强制切 `1M PHY`，而是保留 `2M PHY` 继续运行，避免 `opcode 0x2032 status 0x09` 的重复失败 | 已修复并完成编译验证；待双板回归 |
 | V20 | 从双板日志看 1250 us 放宽后切 1M PHY 已运行 OK，要求提交这一版本 | 在 SCI 成功后先把 interval 放宽到 `> 1 ms`，确认 `1250 us -> 1M PHY` 过渡路径可稳定运行，并以该版本作为当前稳定版本提交 | 已完成双板回归验证；本次提交 |
+| V21 | 增加一个 Button3，在 `750 us + 2M PHY` 和 `1250 us + 1M PHY` 之间切换 | 新增 `BUTTON3` 运行时切换逻辑，在 central 侧 latency 循环中安全执行 profile 切换，并复用已有 SCI / PHY / FSU helper 在两种已验证 profile 间切换 | 已完成编译验证；本次提交 |
+| V22 | 优化 `jitter` 大但 `backoff` 仍为 0 ms 的场景，并让主从 LED 状态更一致 | 将 central 侧 latency request 改为基于当前 connection interval 的固定节拍发送，避免“响应后立即重发”导致的 connection event 相位漂移；同时为 peripheral 增加 latency service 回调，用同一笔 latency 事务驱动 LED1 脉冲 | 已完成编译验证；本次提交 |
+| V23 | 修复 V22 引入的 latency 偏大与 profile 切换首窗混样问题 | 用 controller anchor 对齐的 radio notification prepare 回调替代“任意相位固定节拍”，让 central 在真实 connection event 前发送 request；同时在 profile 切换成功后重置 latency 统计窗口，避免旧 profile 样本混入新 profile 日志 | 已完成编译验证；本次提交 |
+| V24 | 修正 anchor-slot 方案中的固定 latency 偏置 | 将 latency payload 的时间戳基准从“request API 调用时刻”改成“prepare 回调预测的 event 起点时刻”，消除 prepare 预留时间被算进 latency 的固定偏置 | 已完成编译验证；本次提交 |
+| V25 | 修复 `Unhandled vendor-specific event 0x82` | 发现 `bt_hci_register_vnd_evt_cb()` 只有一个全局回调，QoS 回调覆盖了 anchor-point 回调；改为在应用侧使用单一 VS 分发回调，同时处理 QoS report 和 anchor-point report，消除 `0x82` 未处理告警 | 已完成编译验证；本次提交 |
+| V26 | 继续收敛 profile 运行时的大幅 jitter | 根据双板日志确认离群值约等于“一整个 connection interval 再除以 2”，说明 request 偶发滑到了下一个 connection event；将固定 `300 us` prepare 提前量改成随当前 interval 自适应的更晚 slot，给上一笔 response 返回和主线程重新入队留出更多时间 | 已完成编译验证；本次提交 |
 
 ## 详细版本记录
 
@@ -559,6 +565,239 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 - 已使用现有 `build_1` 完成重编译验证，通过。
 - 已完成双板回归验证，central 侧日志已确认 `Requesting wider connection interval before 1M PHY switch: 1250 us`、`Connection rate changed: interval 1250 us ...` 和 `LE PHY updated: TX PHY LE 1M, RX PHY LE 1M` 路径成立。
 - 当前版本确认为稳定版本，本次按该版本提交到 git。
+
+## V21 增加 Button3：在 `750 us + 2M PHY` 和 `1250 us + 1M PHY` 间运行时切换
+
+### 用户要求
+
+增加一个 `Button3`，通过这个按键在 `750 us + 2M PHY` 和 `1250 us + 1M PHY` 两个已验证 profile 之间切换。
+
+### 问题分析
+
+- 当前 demo 在 central 侧已经有两条已验证的链路 profile：
+	- `750 us + 2M PHY`
+	- `1250 us + 1M PHY`
+- 这类切换不能直接在 GPIO ISR 里调用 BLE API，否则会把按钮中断上下文和连接参数更新流程混在一起。
+- 因此本轮采用的实现方式是：
+	- `BUTTON3` 中断只设置一个待处理切换请求
+	- 真正的 interval / PHY / FSU 切换仍放在已有 latency 循环里执行
+	- 这样可以复用现有的 SCI、PHY update 和 frame space update 逻辑，同时保持运行时切换路径可控
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中新增 `BUTTON3`，使用 `DT_ALIAS(sw3)` 作为第三个物理按键。
+- 新增 `enum link_profile`、`requested_link_profile`、`active_link_profile` 和切换 pending / enable 状态，用来跟踪当前和目标 profile。
+- 新增 `switch_to_750us_2m_profile()` 与 `switch_to_1250us_1m_profile()`，分别封装两条切换路径：
+	- `750 us + 2M PHY`
+	- `1250 us + 1M PHY`
+- 在 central 侧 latency 循环中增加 `process_pending_link_profile_switch()`，让 `BUTTON3` 的切换请求在非中断上下文里执行。
+- 启动日志中增加提示，明确 `BUTTON3` 用于在两条 profile 间切换。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 完成编译验证，通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：按下 `BUTTON3` 后，日志是否按预期打印 profile 切换以及对应的 interval / PHY 更新结果。
+
+## V22 优化大抖动窗口并统一主从 LED1 的事务语义
+
+### 用户要求
+
+优化代码，解决 `jitter` 很大但 `backoff` 仍然是 `0 ms`、更像是 connection event 调度或时序相位带来的波动的问题；同时让主机和从机之间的 LED 状态保持一致。
+
+### 问题分析
+
+- 当前 central 侧 latency loop 在收到上一笔 latency response 后，基本立刻就发下一笔 request。
+- 当 `qos_tx_backoff_ms = 0` 时，这种“响应驱动重发”会让发送相位跟着上一笔 response 到达时间漂移，而不是锁定在当前 connection interval 的固定节拍上。
+- 一旦该相位逐渐漂移到 connection event 边界附近，就会出现某一笔 request 跨到额外的 event 才完成，从而把该统计窗口里的 `latency_max_us` 拉高，表现为 `jitter` 突然明显增大。
+- 当前 LED1 只在 central 侧 request / response 路径里驱动，peripheral 侧并没有用同一笔 latency 事务去更新 LED1，因此主从两侧 LED1 的语义并不一致。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中新增 latency request 固定节拍状态：
+	- `latency_request_pacing_interval_us`
+	- `latency_request_deadline_cycle`
+	- `latency_request_pacing_valid`
+- 新增 `latency_request_pacing_reset()` 和 `wait_for_next_latency_request_slot()`，把 central 侧的 request 发送改成“按当前 `active_conn_interval_us` 的绝对节拍发送”，不再让下一笔 request 直接跟着上一笔 response 漂移。
+- 在连接建立、连接断开和 profile 切换成功后，重置 latency pacing 状态，避免旧 profile 的相位继续影响新 profile。
+- 为 latency service 增加 `bt_latency_cb.latency_request` 回调，在 peripheral 收到 latency write request 时点亮 LED1，并用 delayable work 在一个 connection interval 后关闭 LED1。
+- 在 central 侧 response handler 中取消 LED1 的延时关灯 work 并立即灭灯，保证一笔 latency 事务结束后两侧都回到空闲 LED 状态。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 执行 `ninja -C build_1`，编译通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- `backoff 0 ms` 时，`latency max` 是否仍会周期性出现跨 event 的大跳变。
+	- central 与 peripheral 的 LED1 是否都围绕同一笔 latency 事务同步亮灭。
+	- 切换 `BUTTON3` 后，新的 profile 是否会在 1 到 2 个 connection interval 内稳定到新的节拍。
+
+## V23 用 anchor 对齐槽位修复 V22 的 latency 偏大问题
+
+### 用户要求
+
+在 `1250 us -> 1M PHY` 和 `750 us -> 2M PHY` 的运行日志中，发现 V22 后 latency 数值本身变大，而且 profile 切换后的第一条统计窗口混入了旧 profile 的样本，要求继续优化，使 latency 显示恢复正常。
+
+### 问题分析
+
+- V22 的 fixed pacing 只保证“每隔一个 interval 发送一次 request”，但它的初始相位来自应用当前时刻，而不是实际 connection anchor。
+- 这会让 central 稳定地落在一个错误的相位上：
+	- `1250 us + 1M PHY` 稳定打印约 `1411 us`
+	- `750 us + 2M PHY` 稳定打印约 `927 us`
+- 这说明 request 的发送时机虽然稳定了，但没有对齐真实 connection event，导致每一笔 latency 都额外包含了一段固定等待时间。
+- 同时，profile 切换成功后没有清空 latency 统计窗口，因此切换后的第一条日志会把旧 profile 和新 profile 的样本混在一起，表现为 `min/max/jitter` 明显异常。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中移除 V22 的“任意相位 fixed pacing”实现。
+- 改为使用 NCS 提供的 `bt_radio_notification_conn_cb_register()`，在每个 connection event 开始前 `300 us` 触发 `prepare` 回调。
+- central 侧 latency loop 不再自己推算绝对节拍，而是等待下一次由 controller anchor 对齐的 request slot，再立即调用 `bt_latency_request()`。
+- 在 profile 切换成功后新增 `latency_stats_reset()`，避免切换前后的样本混入同一个统计窗口。
+- 为支持上述 feature，同步在 app 和 `sysbuild/ipc_radio` 侧补齐 anchor-point report 相关配置。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [prj.conf](d:/workspace/26_work/shorter_conn_intervals_test/prj.conf)
+- [sysbuild/ipc_radio/prj.conf](d:/workspace/26_work/shorter_conn_intervals_test/sysbuild/ipc_radio/prj.conf)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 完成编译验证，通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- `1250 us + 1M PHY` 是否回落到更接近真实链路事务时间的稳定值，而不是固定在约 `1411 us`。
+	- `750 us + 2M PHY` 是否不再固定在约 `927 us`，同时保持低抖动。
+	- `BUTTON3` 切换后的第一条 latency 日志是否已经不再混入前一 profile 的 `min/max`。
+
+## V24 将 latency 时间戳改为 event 对齐参考时间
+
+### 用户要求
+
+继续修复 `1250 us + 1M PHY` 与 `750 us + 2M PHY` 下 latency 数值整体偏大的问题，使打印出来的 latency 更接近真实链路事务时间。
+
+### 问题分析
+
+- V23 已经把 request 发送节拍对齐到 controller anchor，但 latency payload 里仍然写入“调用 `bt_latency_request()` 的当前时刻”。
+- 由于 prepare 回调本来就是在 connection event 开始前一段时间触发，当前时刻会天然早于真正的 on-air 发送时刻。
+- 这样虽然 jitter 很小，但会给所有样本都叠加一个近似固定的正偏置，表现为：
+	- `1250 us + 1M PHY` 稳定打印在约 `1411 us`
+	- `750 us + 2M PHY` 稳定打印在约 `927 us`
+- 这更像“时间戳基准偏早”而不是链路真的慢了这么多。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中新增 `latency_request_reference_cycle`。
+- `latency_request_prepare_handler()` 在给 central 侧 request slot 放行前，先记录一个“预测的 event 起点时刻”：`k_cycle_get_32() + LATENCY_PREPARE_DISTANCE_US`。
+- central latency loop 在发送 payload 时，优先使用这个 event 对齐的参考时间，而不再直接使用 `bt_latency_request()` 调用时刻。
+- 在连接建立、连接断开、profile 切换和每次等待新 slot 前，把该参考时间清零，避免误用旧 slot 的时间戳。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 完成编译验证，通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- `1250 us + 1M PHY` 的 latency 是否从约 `1411 us` 回落到更接近真实链路事务时间的稳定值。
+	- `750 us + 2M PHY` 的 latency 是否从约 `927 us` 回落，同时保持低 jitter。
+	- 两个 profile 下的平均值是否不再整体抬高，而只保留少量正常调度波动。
+
+## V25 修复 `Unhandled vendor-specific event 0x82`
+
+### 用户要求
+
+运行时日志持续打印：
+
+- `Unhandled vendor-specific event 0x82 len 12: ...`
+
+要求继续定位并修复该问题。
+
+### 问题分析
+
+- `0x82` 对应的是 controller 的 connection anchor point update report。
+- 当前工程在应用启动时先通过 anchor-slot 逻辑注册了一次 vendor-specific event callback，随后又在 QoS enable 路径里再次调用 `bt_hci_register_vnd_evt_cb()` 注册 QoS 回调。
+- 检查 Zephyr host 实现后确认：`bt_hci_register_vnd_evt_cb()` 只有一个全局回调槽，后注册的回调会覆盖先注册的回调。
+- 结果就是：
+	- QoS report 还能被处理；
+	- anchor-point report `0x82` 已经没有对应处理函数，于是被 host 打印成 `Unhandled vendor-specific event`。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中移除对 `bt_radio_notification_conn_cb_register()` 的依赖。
+- 改为在应用侧注册一个统一的 `vs_evt_handler()`，把 vendor-specific event 分发给：
+	- QoS report 处理路径
+	- anchor-point report 处理路径
+- 为 anchor-point report 新增本地 timer 调度逻辑，沿用 controller 提供的 `anchor_point_us` 和当前 connection interval，在应用侧生成下一个 request slot。
+- 保留现有 QoS backoff 逻辑不变，只修复 VS event 分发根因。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 完成编译验证，通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- 连接建立后，`Unhandled vendor-specific event 0x82` 是否已经消失。
+	- QoS 统计是否仍然持续更新。
+	- anchor-slot 驱动下的 latency 日志是否继续稳定输出。
+
+## V26 收敛 profile 运行时的大幅 jitter
+
+### 用户要求
+
+双板日志显示：
+
+- `1250 us + 1M PHY` 下多数窗口稳定在 `883 us / jitter 17 us`，但会间歇出现 `1498~1521 us` 的离群最大值；
+- `750 us + 2M PHY` 下也会周期性出现 `939 us` 或更高的离群值；
+- QoS 一直是 `crc err 0, backoff 0 ms`，要求继续收敛 jitter。
+
+### 问题分析
+
+- 当前 latency 统计值本质上是 round-trip latency 的一半。
+- 对照日志可见：
+	- `1499 - 879 ~= 620 us`，乘以 2 后约等于一个 `1250 us` connection interval；
+	- `939 - 578 ~= 361 us`，乘以 2 后约等于一个 `750 us` connection interval。
+- 这说明当前异常并不是链路重传或 QoS backoff，而是 request 偶发错过了目标 connection event，滑到下一个 event 才上空口。
+- 现有实现把 anchor-slot 的 prepare 提前量固定在 `300 us`。对当前 request/response 闭环来说，这个 slot 偏早，尤其在 `750 us + 2M PHY` 下，上一笔 response 返回后，主线程到下一笔 slot 的剩余时间过小，容易出现“还没重新入队，slot 已经过去”的整 interval 滑移。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中移除固定的 `LATENCY_PREPARE_DISTANCE_US=300`。
+- 改为根据当前 `active_conn_interval_us` 动态计算 prepare 提前量：
+	- 以 `interval / 8` 为基准；
+	- 并限制在 `125 us` 到 `200 us` 之间。
+- central 侧写入 latency 时间戳时，继续以“预测的 event 起点时刻”为基准，只是把 slot 放得更靠后，给 response 返回后的主线程重新挂起和下一笔 request 重新入队留出更多裕量。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已使用现有 `build_1` 完成编译验证，通过。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- `1250 us + 1M PHY` 下是否不再周期性出现 `1498~1521 us` 的离群值；
+	- `750 us + 2M PHY` 下 `939 us` 一类的整 interval 滑移是否显著减少；
+	- QoS `crc err` 和 `backoff` 是否继续保持为 0。
 
 ## 当前 git 状态
 
