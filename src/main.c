@@ -140,6 +140,8 @@ static uint8_t conn_rate_change_status = BT_HCI_ERR_UNSPECIFIED;
 static struct bt_conn_le_min_conn_interval_info local_min_interval_info;
 static bool local_min_interval_groups_valid;
 static enum link_profile active_link_profile = LINK_PROFILE_UNKNOWN;
+static uint8_t active_tx_phy;
+static uint8_t active_rx_phy;
 
 static struct bt_conn *default_conn;
 static struct bt_latency latency;
@@ -172,7 +174,7 @@ static void latency_request_prepare_handler(struct bt_conn *conn)
 {
 	uint32_t prepare_distance_us;
 
-	if (!is_central || !default_conn ||
+	if (!initiate_conn_rate_update || !default_conn ||
 	    (conn != default_conn) ||
 	    (atomic_get(&link_profile_switch_enabled) == 0)) {
 		return;
@@ -272,27 +274,7 @@ static void latency_stats_reset(void)
 
 static void latency_stats_add(uint32_t latency_us)
 {
-	if (latency_sample_count == 0U) {
-		latency_min_us = latency_us;
-		latency_max_us = latency_us;
-	} else {
-		latency_min_us = MIN(latency_min_us, latency_us);
-		latency_max_us = MAX(latency_max_us, latency_us);
-	}
-
-	latency_sum_us += latency_us;
-	latency_sample_count++;
-
-	if (latency_sample_count >= LATENCY_REPORT_INTERVAL) {
-		LOG_INF("Latency avg %u us, min %u us, max %u us, jitter %u us, QoS crc ok %u, "
-			"crc err %u, backoff %u ms",
-			latency_sum_us / latency_sample_count, latency_min_us, latency_max_us,
-			latency_max_us - latency_min_us,
-			(uint32_t)atomic_get(&qos_crc_ok_count),
-			(uint32_t)atomic_get(&qos_crc_error_count),
-			(uint32_t)atomic_get(&qos_tx_backoff_ms));
-		latency_stats_reset();
-	}
+	LOG_INF("Transmission Latency: %u us", latency_us);
 }
 
 static int set_acl_auto_flush_timeout(struct bt_conn *conn, uint16_t flush_timeout_625us)
@@ -435,6 +417,27 @@ static const char *link_profile_to_str(enum link_profile profile)
 	}
 }
 
+static void sync_active_link_profile(void)
+{
+	enum link_profile profile = LINK_PROFILE_UNKNOWN;
+
+	if ((active_conn_interval_us == INTERVAL_2M_PHY_MODE_US) &&
+	    (active_tx_phy == BT_GAP_LE_PHY_2M) &&
+	    (active_rx_phy == BT_GAP_LE_PHY_2M)) {
+		profile = LINK_PROFILE_750US_2M;
+	} else if ((active_conn_interval_us == INTERVAL_1M_PHY_MIN_US) &&
+		   (active_tx_phy == BT_GAP_LE_PHY_1M) &&
+		   (active_rx_phy == BT_GAP_LE_PHY_1M)) {
+		profile = LINK_PROFILE_1250US_1M;
+	}
+
+	active_link_profile = profile;
+
+	if (profile != LINK_PROFILE_UNKNOWN) {
+		atomic_set(&requested_link_profile, (atomic_val_t)profile);
+	}
+}
+
 /* Example GATT service for exchanging minimum supported connection interval. */
 static ssize_t read_min_interval(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 				 uint16_t len, uint16_t offset)
@@ -547,15 +550,20 @@ static bool try_select_role(enum role_selection role)
 
 static void request_link_profile_toggle(void)
 {
+	enum link_profile current_profile;
 	enum link_profile next_profile;
 
-	if (selected_role != ROLE_SELECTION_CENTRAL ||
+	if (!initiate_conn_rate_update ||
 	    atomic_get(&link_profile_switch_enabled) == 0) {
 		return;
 	}
 
-	next_profile = (enum link_profile)atomic_get(&requested_link_profile);
-	if (next_profile == LINK_PROFILE_750US_2M) {
+	current_profile = active_link_profile;
+	if (current_profile == LINK_PROFILE_UNKNOWN) {
+		current_profile = (enum link_profile)atomic_get(&requested_link_profile);
+	}
+
+	if (current_profile == LINK_PROFILE_750US_2M) {
 		next_profile = LINK_PROFILE_1250US_1M;
 	} else {
 		next_profile = LINK_PROFILE_750US_2M;
@@ -874,6 +882,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		conn_info.role == BT_CONN_ROLE_CENTRAL ? "central" : "peripheral");
 	LOG_INF("Conn. interval is %u us", conn_info.le.interval_us);
 	active_conn_interval_us = conn_info.le.interval_us;
+	active_tx_phy = BT_GAP_LE_PHY_1M;
+	active_rx_phy = BT_GAP_LE_PHY_1M;
+	sync_active_link_profile();
 
 	err = set_acl_auto_flush_timeout(default_conn, ACL_AUTO_FLUSH_TIMEOUT_625US);
 	if (err) {
@@ -913,6 +924,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	active_conn_interval_us = INTERVAL_INITIAL_US;
 	atomic_set(&link_profile_switch_pending, 0);
 	atomic_set(&link_profile_switch_enabled, 0);
+	active_tx_phy = 0U;
+	active_rx_phy = 0U;
 	k_work_cancel_delayable(&latency_led_off_work);
 	k_sem_reset(&conn_rate_changed_sem);
 	k_sem_reset(&latency_response_sem);
@@ -1186,6 +1199,7 @@ static void conn_rate_changed(struct bt_conn *conn, uint8_t status,
 
 	if (status == BT_HCI_ERR_SUCCESS) {
 		active_conn_interval_us = params->interval_us;
+		sync_active_link_profile();
 		LOG_INF("Connection rate changed: "
 			"interval %u us, "
 			"subrate factor %d, "
@@ -1243,6 +1257,7 @@ static int update_to_2m_phy(void)
 static int switch_to_750us_2m_profile(void)
 {
 	uint32_t target_interval_us;
+	uint32_t request_max_interval_us;
 	int err;
 
 	err = resolve_link_profile_interval_us(LINK_PROFILE_750US_2M, &target_interval_us);
@@ -1260,7 +1275,15 @@ static int switch_to_750us_2m_profile(void)
 		return err;
 	}
 
-	err = request_conn_interval_update(target_interval_us, target_interval_us);
+	request_max_interval_us = target_interval_us;
+	if (!initiate_conn_rate_update && active_conn_interval_us > target_interval_us) {
+		/* As a peripheral, request a bounded range so the central can pick the
+		 * lowest interval it can support instead of rejecting a strict 750 us point.
+		 */
+		request_max_interval_us = active_conn_interval_us;
+	}
+
+	err = request_conn_interval_update(target_interval_us, request_max_interval_us);
 	if (err) {
 		return err;
 	}
@@ -1342,6 +1365,9 @@ static void process_pending_link_profile_switch(void)
 
 static void le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
 {
+	active_tx_phy = param->tx_phy;
+	active_rx_phy = param->rx_phy;
+	sync_active_link_profile();
 	LOG_INF("LE PHY updated: TX PHY %s, RX PHY %s", phy_to_str(param->tx_phy),
 		phy_to_str(param->rx_phy));
 	k_sem_give(&phy_updated);
@@ -1395,17 +1421,15 @@ static void test_run(void)
 	test_ready = false;
 	latency_stats_reset();
 
-	if (!initiate_conn_rate_update) {
-		return;
-	}
-
 	/* SCI needs the reduced frame space before the controller evaluates the
 	 * request. Do that on the 2M path first, then switch to 1M after SCI succeeds.
 	 */
-	err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_2M_MASK);
-	if (err) {
-		LOG_WRN("2M frame space update failed (err %d)", err);
-		return;
+	if (initiate_conn_rate_update) {
+		err = select_lowest_frame_space(BT_HCI_LE_FRAME_SPACE_UPDATE_PHY_2M_MASK);
+		if (err) {
+			LOG_WRN("2M frame space update failed (err %d)", err);
+			return;
+		}
 	}
 
 	/* Read remote min interval if characteristic was found */
@@ -1464,7 +1488,7 @@ static void test_run(void)
 		atomic_set(&requested_link_profile, (atomic_val_t)active_link_profile);
 	}
 
-	if (active_conn_interval_us <= INTERVAL_TARGET_US) {
+	if (initiate_conn_rate_update && active_conn_interval_us <= INTERVAL_TARGET_US) {
 		LOG_INF("Requesting wider connection interval before 1M PHY switch: %u us",
 			INTERVAL_1M_PHY_MIN_US);
 		err = switch_to_1250us_1m_profile();
@@ -1487,6 +1511,11 @@ latency_loop:
 		uint32_t time;
 
 		process_pending_link_profile_switch();
+
+		if (!initiate_conn_rate_update) {
+			k_sleep(K_MSEC(10));
+			continue;
+		}
 
 		if (qos_backoff_ms != 0U) {
 			k_sleep(K_MSEC(qos_backoff_ms));

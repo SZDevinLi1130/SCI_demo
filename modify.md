@@ -38,6 +38,10 @@
 | V24 | 修正 anchor-slot 方案中的固定 latency 偏置 | 将 latency payload 的时间戳基准从“request API 调用时刻”改成“prepare 回调预测的 event 起点时刻”，消除 prepare 预留时间被算进 latency 的固定偏置 | 已完成编译验证；本次提交 |
 | V25 | 修复 `Unhandled vendor-specific event 0x82` | 发现 `bt_hci_register_vnd_evt_cb()` 只有一个全局回调，QoS 回调覆盖了 anchor-point 回调；改为在应用侧使用单一 VS 分发回调，同时处理 QoS report 和 anchor-point report，消除 `0x82` 未处理告警 | 已完成编译验证；本次提交 |
 | V26 | 继续收敛 profile 运行时的大幅 jitter | 根据双板日志确认离群值约等于“一整个 connection interval 再除以 2”，说明 request 偶发滑到了下一个 connection event；将固定 `300 us` prepare 提前量改成随当前 interval 自适应的更晚 slot，给上一笔 response 返回和主线程重新入队留出更多时间 | 已完成编译验证；本次提交 |
+| V27 | 简化 latency 日志并让主从都能用 Button3 切换 profile | 将 latency 统计日志收敛为仅输出平均值与 jitter；移除 Button3 的 central-only 限制，让 central 和 peripheral 都进入同一条 runtime profile 控制路径，谁按下 Button3 就由谁发起切换 | 已完成编译验证；本次提交 |
+| V28 | 修复从机侧 latency slot 超时与 750 us 切换失败 | 放开 peripheral 侧的 anchor-slot 放行条件，避免进入 runtime loop 后长期等不到 slot；同时将 peripheral 发起的 `750 us + 2M PHY` 切换改为有界区间请求，避免严格 `750 us` 单点导致 `opcode 0x20a1 status 0x11` | 已完成编译验证；本次提交 |
+| V29 | 恢复为单边输出传输 latency，消除主从显示不同步 | 回退为当时“只输出 Transmission Latency”的方式：仅 initiator 侧继续发送 latency request 并打印传输 latency；另一侧仅保留 Button3 的 runtime profile 切换能力，不再参与 latency 发送与统计 | 已完成编译验证；本次提交 |
+| V30 | 去掉从机侧 Button3 的 PHY 切换能力 | 将 Button3 入口重新收紧为 initiator-only，只保留 central 侧切换 `750 us + 2M PHY` / `1250 us + 1M PHY` 的能力；peripheral 不再响应本地 Button3 触发的 PHY/profile 切换 | 已完成编译验证；本次提交 |
 
 ## 详细版本记录
 
@@ -798,6 +802,159 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 	- `1250 us + 1M PHY` 下是否不再周期性出现 `1498~1521 us` 的离群值；
 	- `750 us + 2M PHY` 下 `939 us` 一类的整 interval 滑移是否显著减少；
 	- QoS `crc err` 和 `backoff` 是否继续保持为 0。
+
+## V27 简化 latency 日志并让主从都能用 Button3 切换 profile
+
+### 用户要求
+
+继续修改：
+
+- 主机和从机都只打印平均传输 latency 与 jitter 两项；
+- 主机和从机都可以通过 `BUTTON3` 在 `750 us + 2M PHY` 与 `1250 us + 1M PHY` 之间切换，谁按下 `BUTTON3` 就以谁发起的切换为准。
+
+### 问题分析
+
+- 当前日志窗口除了 `avg/jitter` 之外还打印 `min/max/QoS/backoff`，不符合这轮简化输出的要求。
+- 当前 `BUTTON3` 逻辑只允许 central 侧发起切换；peripheral 即便完成了服务发现，也会因为 `test_run()` 中的早退而完全不进入 runtime latency/profile 控制路径。
+- 对照 Nordic 原始 sample，latency request 循环本来就不要求只在 initiator 一侧运行；真正需要限制到 initiator 一侧的只是启动阶段的初始 SCI/profile 建链过程。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中将 latency 统计日志改为只输出：
+	- `Latency avg ... us`
+	- `jitter ... us`
+- 移除 `BUTTON3` 的 central-only 判断，让 central 与 peripheral 只要进入 runtime loop 后都可以提交 profile 切换请求。
+- 调整 `test_run()` 控制流：
+	- 初始的 `2M FSU` 与自动切到 `1250 us + 1M PHY` 仍只由 initiator 侧负责；
+	- 但两侧都会进入 latency request / runtime profile loop，因此两侧都能打印 latency 统计，也都能消费本地 `BUTTON3` 请求。
+- 新增本地 profile 同步逻辑，根据当前 connection interval 与 PHY 状态推断 `active_link_profile`，避免另一侧第一次按 `BUTTON3` 时因本地 profile 状态未知而切错方向。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已完成编译验证。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- central 和 peripheral 是否都只再打印 `avg/jitter` 两项；
+	- 在任一侧按下 `BUTTON3` 后，两侧链路是否都切到对应 profile；
+	- 两侧同时具备 runtime 切换能力后，latency 抖动是否仍保持在当前可接受范围内。
+
+## V28 修复从机侧 latency slot 超时与 750 us 切换失败
+
+### 用户要求
+
+从机侧运行日志显示：
+
+- 持续打印 `Timed out waiting for the next latency request slot`；
+- 从机按下 `BUTTON3` 切到 `750 us + 2M PHY` 时，出现 `opcode 0x20a1 status 0x11 BT_HCI_ERR_UNSUPP_FEATURE_PARAM_VAL`。
+
+要求继续修复这两个运行时错误。
+
+### 问题分析
+
+- V27 让 peripheral 也进入了 runtime latency/profile loop，但 anchor-slot 的实际放行函数 `latency_request_prepare_handler()` 里仍然保留了 `!is_central` 的早退条件。
+- 结果就是：
+	- peripheral 进入 latency loop 后会等待 `latency_request_slot_sem`；
+	- 但本地 timer 即使触发，也不会真正给这个 semaphore 放行；
+	- 因而从机侧会持续打印 `Timed out waiting for the next latency request slot`。
+- 同时，peripheral 发起 `750 us + 2M PHY` 切换时沿用了 central 侧的“严格 `750 us` 单点 request”路径。
+- 对 peripheral 侧的 SCI 请求，这种严格单点更容易被 central/controller 拒绝；之前官方 sample 的注释也提示，peripheral 更适合请求一个有界区间，让 central 在区间内选取它能接受的最短 interval。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中移除了 `latency_request_prepare_handler()` 里的 central-only 早退，让 peripheral 侧在进入 runtime loop 后也能真正收到 anchor-slot 放行。
+- 保留现有 anchor-point report 和本地 timer 机制不变，只修正错误的角色限制。
+- 将 `switch_to_750us_2m_profile()` 中 peripheral 发起的 connection rate request 改为有界区间请求：
+	- 最小值仍为目标 `750 us`；
+	- 最大值放宽到当前 active interval；
+	- 让 central/controller 在该区间内选择它能接受的最短值，避免严格单点 `750 us` 直接触发 `0x20a1 status 0x11`。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已完成编译验证。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- peripheral 侧是否不再持续打印 `Timed out waiting for the next latency request slot`；
+	- peripheral 按下 `BUTTON3` 切到 `750 us + 2M PHY` 时，是否不再报 `opcode 0x20a1 status 0x11`；
+	- 两侧在 `750 us + 2M PHY` 和 `1250 us + 1M PHY` 间切换后，latency 日志是否继续只输出 `avg/jitter`。
+
+## V29 恢复为单边输出传输 latency，消除主从显示不同步
+
+### 用户要求
+
+主/从机之间的 latency 显示不同步，要求改回到之前“只输出传输 latency”的方式。
+
+### 问题分析
+
+- 当前主从两侧都会进入 latency 主循环，并各自发起 `bt_latency_request()`。
+- 因此两边实际上测量的是不同的 latency 事务，日志天然不会同步。
+- 用户这里要恢复的是更早那种“只输出 `Transmission Latency`”的工作方式，本质上也就是恢复为单边发起测量、单边打印。
+- 在当前工程里，真正需要保留在两侧的只是 `BUTTON3` profile 切换能力；latency request 本身不需要两边同时发起。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中将 latency 输出恢复为：
+	- `Transmission Latency: %u us`
+- 恢复 initiator-only 的 latency slot 放行条件，避免非 initiator 侧继续参与 latency request 调度。
+- 在 runtime loop 中让非 initiator 侧只做两件事：
+	- 处理本地 `BUTTON3` 发起的 profile 切换
+	- 保持连接存活等待
+- initiator 侧继续负责 latency request 的发送和 `Transmission Latency` 日志输出。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已完成编译验证。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- 是否只剩 initiator 一侧打印 `Transmission Latency: ... us`；
+	- 另一侧是否不再输出不同步的 latency 数值；
+	- 即使只保留单边 latency 输出，主从两侧的 `BUTTON3` profile 切换能力是否仍保持可用。
+
+## V30 去掉从机侧 Button3 的 PHY 切换能力
+
+### 用户要求
+
+去掉从机端的 `BUTTON3` 切换 `1M / 2M PHY` 功能，只保留主机端切换 PHY。
+
+### 问题分析
+
+- 在 V29 之后，latency 已经恢复为 initiator-only 输出，但 `BUTTON3` 的入口仍对主从两侧开放。
+- 这意味着 peripheral 侧虽然不再发送 latency request，仍然可能通过本地 `BUTTON3` 发起 profile 切换。
+- 本轮要求很明确：只保留主机端切换 PHY，因此最小且安全的修复就是把 `BUTTON3` 的入口重新收紧到 initiator 侧。
+
+### 实际修改
+
+- 在 [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c) 中为 `request_link_profile_toggle()` 重新增加 initiator-only 条件。
+- 现在只有 `initiate_conn_rate_update == true` 的一侧，也就是 central / 主机侧，才能通过 `BUTTON3` 发起 `750 us + 2M PHY` 和 `1250 us + 1M PHY` 之间的切换。
+- peripheral / 从机侧按下 `BUTTON3` 将不再触发 PHY/profile 切换。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已完成编译验证。
+- 提交：本次提交。
+- 运行时回归时建议重点观察：
+	- central 侧 `BUTTON3` 是否仍可正常在两个 profile 间切换；
+	- peripheral 侧按下 `BUTTON3` 后是否不再打印切换日志；
+	- 连接和单边 `Transmission Latency` 输出路径是否保持不变。
 
 ## 当前 git 状态
 
