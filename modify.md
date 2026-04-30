@@ -42,6 +42,7 @@
 | V28 | 修复从机侧 latency slot 超时与 750 us 切换失败 | 放开 peripheral 侧的 anchor-slot 放行条件，避免进入 runtime loop 后长期等不到 slot；同时将 peripheral 发起的 `750 us + 2M PHY` 切换改为有界区间请求，避免严格 `750 us` 单点导致 `opcode 0x20a1 status 0x11` | 已完成编译验证；本次提交 |
 | V29 | 恢复为单边输出传输 latency，消除主从显示不同步 | 回退为当时“只输出 Transmission Latency”的方式：仅 initiator 侧继续发送 latency request 并打印传输 latency；另一侧仅保留 Button3 的 runtime profile 切换能力，不再参与 latency 发送与统计 | 已完成编译验证；本次提交 |
 | V30 | 去掉从机侧 Button3 的 PHY 切换能力 | 将 Button3 入口重新收紧为 initiator-only，只保留 central 侧切换 `750 us + 2M PHY` / `1250 us + 1M PHY` 的能力；peripheral 不再响应本地 Button3 触发的 PHY/profile 切换 | 已完成编译验证；本次提交 |
+| V31 | 进一步优化代码增加传输的稳定性 | 在 `latency_stats_add()` 中恢复窗口级 avg/jitter 统计并关联 QoS 输出；增加基于 jitter 大小的主动式退避机制；在 `disconnected()` 中引入 100~300 ms 的随机化重连延迟，降低主从同时重连的竞争概率 | 已完成编译验证；本次提交 |
 
 ## 详细版本记录
 
@@ -604,7 +605,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 完成编译验证，通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：按下 `BUTTON3` 后，日志是否按预期打印 profile 切换以及对应的 interval / PHY 更新结果。
 
 ## V22 优化大抖动窗口并统一主从 LED1 的事务语义
@@ -639,7 +640,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 执行 `ninja -C build_1`，编译通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- `backoff 0 ms` 时，`latency max` 是否仍会周期性出现跨 event 的大跳变。
 	- central 与 peripheral 的 LED1 是否都围绕同一笔 latency 事务同步亮灭。
@@ -678,7 +679,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 完成编译验证，通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- `1250 us + 1M PHY` 是否回落到更接近真实链路事务时间的稳定值，而不是固定在约 `1411 us`。
 	- `750 us + 2M PHY` 是否不再固定在约 `927 us`，同时保持低抖动。
@@ -714,7 +715,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 完成编译验证，通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- `1250 us + 1M PHY` 的 latency 是否从约 `1411 us` 回落到更接近真实链路事务时间的稳定值。
 	- `750 us + 2M PHY` 的 latency 是否从约 `927 us` 回落，同时保持低 jitter。
@@ -756,7 +757,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 完成编译验证，通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- 连接建立后，`Unhandled vendor-specific event 0x82` 是否已经消失。
 	- QoS 统计是否仍然持续更新。
@@ -797,7 +798,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已使用现有 `build_1` 完成编译验证，通过。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- `1250 us + 1M PHY` 下是否不再周期性出现 `1498~1521 us` 的离群值；
 	- `750 us + 2M PHY` 下 `939 us` 一类的整 interval 滑移是否显著减少；
@@ -837,7 +838,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已完成编译验证。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- central 和 peripheral 是否都只再打印 `avg/jitter` 两项；
 	- 在任一侧按下 `BUTTON3` 后，两侧链路是否都切到对应 profile；
@@ -881,7 +882,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已完成编译验证。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- peripheral 侧是否不再持续打印 `Timed out waiting for the next latency request slot`；
 	- peripheral 按下 `BUTTON3` 切到 `750 us + 2M PHY` 时，是否不再报 `opcode 0x20a1 status 0x11`；
@@ -918,7 +919,7 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已完成编译验证。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- 是否只剩 initiator 一侧打印 `Transmission Latency: ... us`；
 	- 另一侧是否不再输出不同步的 latency 数值；
@@ -950,17 +951,68 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 ### 结果
 
 - 验证：已完成编译验证。
-- 提交：本次提交。
+- 提交：`499e55f`
 - 运行时回归时建议重点观察：
 	- central 侧 `BUTTON3` 是否仍可正常在两个 profile 间切换；
 	- peripheral 侧按下 `BUTTON3` 后是否不再打印切换日志；
 	- 连接和单边 `Transmission Latency` 输出路径是否保持不变。
 
+## V31 增加窗口统计、QoS 关联输出、主动 jitter 退避与断连随机延迟
+
+### 用户要求
+
+进一步优化代码，提高传输稳定性，降低因调度相位抖动和断连重连竞争导致的连接质量下降。
+
+### 问题分析
+
+- 当前 `latency_stats_add()` 只输出每笔 `Transmission Latency` 单值，不会对窗口内 `min/max/avg/jitter` 做任何统计聚合。
+- 但 `latency_sum_us / latency_min_us / latency_max_us / latency_sample_count` 变量已在之前版本声明，处于「已声明但从未用于统计计算」的状态。
+- QOS CRC 数据（ok/err count、backoff）虽然已通过 QoS report 收集，但没有在任何日志中输出，无法配合 jitter 数值判断信道质量。
+- 当前退避只由 CRC 错误**被动触发**（反应式）；没有主动基于 jitter 大小的退避机制，当调度相位滑动但无丢包时，jitter 可能持续偏高。
+- 断连后主从两侧都立即调用 `scan_start()` / `adv_start()` 重连，没有引入任何随机化时序，容易出现主从同时扫描/广播导致建链延迟或竞争。
+
+### 实际修改
+
+- **新增稳定性宏定义**：
+  - `STABILITY_BACKOFF_THRESHOLD_US = 500`：jitter 阈值，超过则触发主动退避。
+  - `STABILITY_BACKOFF_INTERVAL_MS = 2`：主动退避时长，一次窗口周期内仅施加一次。
+  - `RECONNECT_DELAY_MIN_MS = 100` / `RECONNECT_DELAY_MAX_MS = 300`：断连后随机延迟窗口。
+- **增强 `latency_stats_add()`**：
+  - 恢复窗口内 `sum / min / max / sample_count` 的累加逻辑。
+  - 每 `LATENCY_REPORT_INTERVAL`（200）个样本输出一次窗口统计：
+    - `Window[200]: avg X us, jitter Y us, QoS(crc ok Z, err W, backoff V ms)`
+  - 若窗口 jitter 超过 `500 us` 且当前 `backoff == 0`，主动设置 `backoff = 2 ms`，在下一次 request 前休眠，让调度有机会收敛。
+  - 窗口结束时重置累加变量和 QoS 计数。
+- **`disconnected()` 中增加随机化重连延迟**：
+  - 使用 `sys_rand32_get()` 在 `100..300 ms` 范围内随机取值。
+  - 调用 `k_sleep()` 后再执行 `scan_start()` / `adv_start()`，降低主从同时重连的竞态概率。
+- 新增包含头文件 `<zephyr/random/random.h>` 以使用 `sys_rand32_get()`。
+- **保留所有原有功能不变**：
+  - `Transmission Latency: X us` 仍每笔输出。
+  - `BUTTON3` 切换 profile（initiator-only）、LED 逻辑、回复式 CRC backoff 均不受影响。
+
+### 影响文件
+
+- [src/main.c](d:/workspace/26_work/shorter_conn_intervals_test/src/main.c)
+- [modify.md](d:/workspace/26_work/shorter_conn_intervals_test/modify.md)
+
+### 结果
+
+- 验证：已完成编译验证。
+- 提交：`499e55f`
+- 运行时回归时建议重点观察：
+  - 每 200 笔是否输出 `Window[200]: avg ... us, jitter ... us, QoS(crc ok ..., err ..., backoff ... ms)`。
+  - 在链路质量好时（CRC err = 0），jitter 是否仍保持稳定低位，不触发主动退避。
+  - 在 jitter 偶发波动后，`backoff 2 ms` 是否被正确设定并在下一个窗口周期内自动衰减回 0。
+  - 断连后 central / peripheral 的重新扫描/广播是否在 100~300 ms 的随机延迟后才执行，而不是立即触发。
+  - `Transmission Latency: X us` 的单笔日志是否仍然保持每 latency 事务输出一行。
+
 ## 当前 git 状态
 
 - 当前分支：`master`
 - 当前远端：`origin`
-- V11 修复完成后，应以最新 `git log` 结果为准查看提交状态。
+- 最新提交：`499e55f`
+- V31 已完成 git 提交。
 
 ## 后续建议
 
@@ -971,3 +1023,4 @@ LED1 按照蓝牙通信的迟延进行闪烁，当通信断开时 LED1 熄灭。
 3. 影响范围
 4. 是否已编译验证
 5. 是否已提交到 git
+

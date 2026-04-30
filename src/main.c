@@ -27,6 +27,7 @@
 #include <bluetooth/gatt_dm.h>
 #include <sdc_hci_cmd_controller_baseband.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/random/random.h>
 
 LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
@@ -46,6 +47,10 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define LATENCY_PREPARE_DISTANCE_MIN_US 125U
 #define LATENCY_PREPARE_DISTANCE_MAX_US 200U
 #define LATENCY_PREPARE_DISTANCE_DIVISOR 8U
+#define STABILITY_BACKOFF_THRESHOLD_US 500
+#define STABILITY_BACKOFF_INTERVAL_MS 2
+#define RECONNECT_DELAY_MIN_MS 100
+#define RECONNECT_DELAY_MAX_MS 300
 
 static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -275,6 +280,40 @@ static void latency_stats_reset(void)
 static void latency_stats_add(uint32_t latency_us)
 {
 	LOG_INF("Transmission Latency: %u us", latency_us);
+
+	latency_sum_us += latency_us;
+	if (latency_min_us == 0U || latency_us < latency_min_us) {
+		latency_min_us = latency_us;
+	}
+	if (latency_max_us == 0U || latency_us > latency_max_us) {
+		latency_max_us = latency_us;
+	}
+	latency_sample_count++;
+
+	if (latency_sample_count >= LATENCY_REPORT_INTERVAL) {
+		uint32_t avg_us = latency_sum_us / latency_sample_count;
+		uint32_t jitter_us = latency_max_us - latency_min_us;
+		uint32_t crc_ok = (uint32_t)atomic_get(&qos_crc_ok_count);
+		uint32_t crc_err = (uint32_t)atomic_get(&qos_crc_error_count);
+		uint32_t backoff_ms = (uint32_t)atomic_get(&qos_tx_backoff_ms);
+
+		LOG_INF("Window[%u]: avg %u us, jitter %u us, QoS(crc ok %u, err %u, backoff %u ms)",
+			(uint32_t)LATENCY_REPORT_INTERVAL, avg_us, jitter_us,
+			crc_ok, crc_err, backoff_ms);
+
+		/* Proactive stability backoff: if jitter exceeds threshold and no CRC backoff active,
+		 * apply a small spacing to let the connection event schedule settle.
+		 */
+		if (jitter_us > STABILITY_BACKOFF_THRESHOLD_US && backoff_ms == 0U) {
+			atomic_set(&qos_tx_backoff_ms, (atomic_val_t)STABILITY_BACKOFF_INTERVAL_MS);
+		}
+
+		latency_sum_us = 0;
+		latency_min_us = 0;
+		latency_max_us = 0;
+		latency_sample_count = 0;
+		qos_stats_reset();
+	}
 }
 
 static int set_acl_auto_flush_timeout(struct bt_conn *conn, uint16_t flush_timeout_625us)
@@ -934,6 +973,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	if (default_conn) {
 		bt_conn_unref(default_conn);
 		default_conn = NULL;
+	}
+
+	/* Add a small randomized delay before reconnecting to reduce the
+	 * chance of simultaneous reconnect between both sides.
+	 */
+	{
+		uint32_t reconnect_delay_ms = RECONNECT_DELAY_MIN_MS +
+			(sys_rand32_get() % (RECONNECT_DELAY_MAX_MS - RECONNECT_DELAY_MIN_MS + 1));
+
+		k_sleep(K_MSEC(reconnect_delay_ms));
 	}
 
 	/* Restart scanning or advertising based on configured role */
